@@ -1,0 +1,312 @@
+
+//////////////////////////////////STATA/////////////////////////////
+
+//////////////////////////////////////////CLEANING AND RECODING////////////////////////////////
+
+// ADDITION OF TOTALS ACROSS ALL TYPES
+egen total_inj = rowtotal(total_inj_firearms total_inj_knife total_inj_other total_inj_hands), missing
+egen total_noninj = rowtotal(total_noninj_firearms total_noninj_knife total_noninj_other total_noninj_hands), missing
+egen total_incidents = rowtotal (total_inj total_noninj), missing
+
+* Total incidents involving firearms
+egen total_firearms = rowtotal(total_inj_firearms total_noninj_firearms), missing
+
+* Total incidents involving knives
+egen total_knife    = rowtotal(total_inj_knife    total_noninj_knife),    missing
+
+* Total incidents involving other weapons
+egen total_other    = rowtotal(total_inj_other    total_noninj_other),    missing
+
+* Total incidents involving hands (or unarmed)
+egen total_hands    = rowtotal(total_inj_hands    total_noninj_hands),    missing
+
+
+// ADDITION OF TOTALS ACROSS ALL TYPES
+
+// Generate Total Officer Variable
+egen total_officers = rowtotal(officers_women officer_men), missing
+
+//Standardizing basic_lgth
+* 1. Create a new variable for standardized hours
+gen basic_lgth_hours = .
+
+* 2. Keep original if already in hours
+replace basic_lgth_hours = basic_lgth if basic_type == 1
+
+* 3. Convert weeks to hours (5 business days × 8 hours/day = 40 hours/week)
+replace basic_lgth_hours = basic_lgth * 40 if basic_type == 2
+
+* 4. Convert months to hours (4.33 weeks/month × 5 business days/week × 8 hours/day = 173.2 hours/month)
+replace basic_lgth_hours = basic_lgth * 173.2 if basic_type == 3
+
+* 5. Convert semesters to hours (3 months × 173.2 hours/month = 519.6 hours/semester)
+replace basic_lgth_hours = basic_lgth * 519.6 if basic_type == 4
+
+* 6. Handle 'Other increment' and N/A: keep as missing
+replace basic_lgth_hours = . if inlist(basic_type, 5, -8)
+
+* Optional: check the distribution
+summarize basic_lgth basic_lgth_hours
+
+*Removing all non-batch variables*
+keep order statecode academyname environment ft_sworn ft_civ ft_total pt_total eval_post eval_supe eval_stud refresher pat_yn pat judo_yn judo def_tac def_tac_yn fire_skill_yn fire_skill nonl_yn nonl field_man fitness_1 obstacle_1 scenario_1 simu_1 sex_start_total pt_civ pt_sworn comp_yn comp comm_yn comm stress_yn stress medi_yn medi domv_yn domv victim_yn victim post calea total_inj_firearms total_inj_knife total_inj_other total_inj_hands total_noninj_firearms total_noninj_knife total_noninj_other total_noninj_hands  gang gang_yn  pat judo_est def_tac_est fire_skill_est nonl_est comp_est comm_est stress_est medi_est domv_est victim victim_est gang_est min_exp ebudget opbudget agencyc agencycletatype basic_lgth field_lgth oversee min_ed req_post req_sme req_acad in_fire_1 out_fire_1 clab_1 int_1 media_1 dorm_1 opbudget_est ebudget_est sex_comp_total rno_total ori ori  state_nom population officer_men officers_women all_employees  stress  total_inj total_noninj total_actual total_cleared total_officers pat_yn prob_solv prob_solv_yn acsh_yn acsh basic_lgth_hours comm ethic health prof cult prob_solv crim jjl traf_law study com_part cult  prob_solv map comm ethic prof stress cpr comp emv evid intel intero inv pat rep traf judo def_tac fire_skill nonl crim_yn jjl_yn traf_law_yn study_yn com_part_yn cult_yn medi_yn prob_solv_yn map_yn comm_yn ethic_yn prof_yn stress_yn cpr_yn comp_yn emv_yn evid_yn intel_yn intero_yn inv_yn pat_yn rep_yn traf_yn judo_yn def_tac_yn fire_skill_yn nonl_yn health_yn dui dui_yn emr emr_yn htraf htraf_yn mental mental_yn opioid opioid_yn total_incidents total_firearms total_knife total_hands total_other
+
+// Recode min_ed var
+gen min_ed_cat = cond(min_ed == 1, 3, cond(inlist(min_ed, 2, 3), 2, cond(inlist(min_ed, 4, 5, 6), 1, .)))
+label define min_ed_cat_lbl 1 "High school or less" 2 "College" 3 "Graduate", replace
+label values min_ed_cat min_ed_cat_lbl
+
+// both fire range access
+gen any_fire_range = .
+replace any_fire_range = 1 if in_fire_1 == 1 | out_fire_1 == 1
+replace any_fire_range = 0 if in_fire_1 != . & out_fire_1 != . & in_fire_1 != 1 & out_fire_1 != 1
+
+
+// Recode Agency type var/
+gen agency_type3 = cond(inlist(agencycletatype, 1,2,3,4,5), 1, cond(inlist(agencycletatype, 6,7), 2, 3))
+label define agency_type3_lbl 1 "Regular" 2 "College" 3 "Other", replace
+label values agency_type3 agency_type3_lbl
+
+
+
+foreach var in refresher pat_yn judo_yn def_tac_yn fire_skill_yn nonl_yn comp_yn gang_yn comm_yn stress_yn medi_yn domv_yn victim_yn eval_post eval_stud crim_yn jjl_yn traf_law_yn study_yn com_part_yn cult_yn prob_solv_yn map_yn ethic_yn prof_yn cpr_yn emv_yn evid_yn intel_yn intero_yn inv_yn rep_yn traf_yn health_yn dui_yn emr_yn htraf_yn mental_yn opioid_yn {
+    replace `var' = 0 if `var' == 2
+}
+
+
+// Eliminate -8 observations to '.'
+ds, has(type numeric)
+foreach var of varlist `r(varlist)' {
+    replace `var' = . if `var' == -8 
+}
+	
+*Recode field_man*
+recode field_man (1=3) (2=2) (3=1)
+
+*Reverse Original Stress var/ recode ordinal var
+recode environment (1=5) (2=4) (3=3) (4=2) (5=1)
+
+gen environment_3 = .
+
+replace environment_3 = 1 if inlist(environment, 4, 5)
+replace environment_3 = 2 if environment == 3
+replace environment_3 = 3 if inlist(environment, 1, 2)
+label values environment_3 
+
+* 0. Create instructor‐to‐cadet ratio
+drop if (ft_total + pt_total) == 0
+gen instructor_ratio = (ft_total + pt_total) / sex_start_total
+label variable instructor_ratio 
+
+*Create Clearance Rate var
+drop if total_cleared == 0
+drop if total_actual == 0
+
+gen clearance_rate = .
+replace clearance_rate = (total_cleared / total_actual) * 100 if total_actual > 0
+
+	
+// Aligned lists (hour variables and matching _yn indicators)
+local vars     pat judo def_tac fire_skill nonl comp gang comm stress medi domv victim crim jjl traf_law study com_part cult prob_solv map ethic prof cpr emv evid intel intero inv rep traf health dui emr htraf mental opioid
+local vars_yn  pat_yn judo_yn def_tac_yn fire_skill_yn nonl_yn comp_yn gang_yn comm_yn stress_yn medi_yn domv_yn victim_yn crim_yn jjl_yn traf_law_yn study_yn com_part_yn cult_yn prob_solv_yn map_yn ethic_yn prof_yn cpr_yn emv_yn evid_yn intel_yn intero_yn inv_yn rep_yn traf_yn health_yn dui_yn emr_yn htraf_yn mental_yn opioid_yn
+
+
+
+local nvars : word count `vars'
+forvalues i = 1/`nvars' {
+    local v : word `i' of `vars'
+    local vyn : word `i' of `vars_yn'
+    replace `v' = 0 if `vyn' == 0
+}
+
+
+// 1️⃣ Create total training hours across selected subjects
+egen total_studyhours = rowtotal(crim jjl traf_law study com_part cult medi prob_solv map comm ethic prof stress cpr comp emv evid intel intero inv pat rep traf judo def_tac fire_skill nonl opioid mental htraf emr dui gang)
+
+
+
+// 2️⃣ Loop over each subject to compute proportion and high emphasis flag
+foreach v in pat judo def_tac fire_skill nonl comp gang comm stress medi domv victim eval_post eval_stud crim jjl traf_law study com_part cult prob_solv map ethic prof cpr emv evid intel intero inv rep traf health dui emr htraf mental opioid {
+    
+    // Compute proportion of total training allocated to this subject
+    gen `v'_prop = `v' / total_studyhours
+
+    // Get median proportion across all observations
+    quietly summarize `v'_prop
+    local thresh = r(p50)
+
+    // Create high emphasis indicator: 1 if proportion >= median, else 0
+    gen byte `v'_high = `v'_prop >= `thresh'
+
+    // Add descriptive label
+    label variable `v'_high "`v': 1=High emphasis (≥ median share)"
+}
+
+///////////////////////////////////////////////////ANALYSIS/////////////////////////////////////////////////////
+
+* -------------------------------------------
+* LOAD DATA
+* -------------------------------------------
+use "/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Analysis/STATA/GLM_Ready_May15(MULTI).dta", clear
+
+drop if total_officers < 5
+
+ summarize basic_lgth_hours environment_3 ft_sworn ft_civ min_ed_cat ///
+    opbudget simu_1 scenario_1 obstacle_1  refresher  field_man agency_type3 ///
+     simu_1 ///
+    scenario_1 total_officers total_actual total_cleared 
+
+drop if missing(basic_lgth_hours, environment_3, ft_sworn, ft_civ, min_ed_cat,  simu_1, scenario_1,  refresher,field_man, agency_type3, total_officers, total_actual, total_cleared, judo, def_tac, fire_skill, nonl, domv, mental, opioid, victim, comm ,prof, medi, prob_solv)
+	
+summarize basic_lgth_hours i.environment_3 ft_sworn ft_civ i.min_ed_cat refresher  i.field_man i.agency_type3 judo def_tac fire_skill nonl domv mental opioid victim comm prof medi prob_solv total_officers total_cleared total_actual total_hands total_knife total_firearms total_other total_incidents total_inj_hands total_inj_knife total_inj_firearms total_inj_other total_inj	
+
+* -------------------------------------------
+* Z-SCORE CONTINUOUS VARIABLES
+* -------------------------------------------
+summarize basic_lgth_hours
+gen z_basic_lgth_hours = (basic_lgth_hours - r(mean)) / r(sd)
+
+summarize ft_sworn
+gen z_ft_sworn = (ft_sworn - r(mean)) / r(sd)
+
+summarize ft_civ
+gen z_ft_civ = (ft_civ - r(mean)) / r(sd)
+
+summarize ebudget
+gen z_ebudget = (ebudget - r(mean)) / r(sd)
+
+summarize total_officers
+gen z_total_officers = (total_officers - r(mean)) / r(sd)
+
+summarize total_actual
+gen z_total_actual = (total_actual - r(mean)) / r(sd)
+
+summarize total_cleared
+gen z_total_cleared = (total_cleared - r(mean)) / r(sd)
+
+
+//Factor Analysis for Study Areas
+
+factor judo def_tac fire_skill nonl 
+predict force_based
+
+factor domv mental opioid victim 
+predict special_study
+
+factor comm prof medi prob_solv 
+predict modern_study
+
+* -------------------------------------------
+* TOTALS: total_inj + total_incidents (Cook's D applied correctly)
+* -------------------------------------------
+local dv_list " total_incidents total_firearms total_knife total_other total_hands"
+eststo clear
+
+
+
+foreach dv of local dv_list {
+    di "---------------------------------------"
+    di "Processing dependent variable: `dv'"
+
+    preserve
+
+    * Step 1: Initial model for Cook's D calculation
+    quietly glm `dv' z_basic_lgth_hours ib2.environment_3 z_ft_sworn z_ft_civ ///
+        i.min_ed_cat  simu_1 scenario_1 obstacle_1 refresher  ib3.field_man i.agency_type3 ///
+        force_based special_study  modern_study simu_1  ///
+        scenario_1  z_total_officers z_total_cleared z_total_actual, family(nbinomial) link(log)
+		
+    * Step 2: Cook's D filtering
+    capture drop cooksd
+    predict cooksd, cooksd
+    scalar cutoff = 4 / e(N)
+    di "Cook's D cutoff (4/N) = " %6.4f cutoff
+
+    gen cleaned_`dv' = `dv'
+    replace cleaned_`dv' = . if cooksd > cutoff
+
+    tempfile temp_clean_`dv'
+    save `temp_clean_`dv'', replace
+
+    restore
+    use `temp_clean_`dv'', clear
+
+    * Step 3: Refit model on cleaned DV
+    nbreg cleaned_`dv' z_basic_lgth_hours ib2.environment_3 z_ft_sworn z_ft_civ ///
+        i.min_ed_cat   refresher  ib3.field_man i.agency_type3 ///
+        force_based special_study  modern_study simu_1  ///
+        scenario_1  z_total_officers z_total_cleared z_total_actual , irr
+		
+
+    estimates store m_`dv'
+    eststo m_`dv'
+
+  
+}
+
+
+* -------------------------------------------
+* INJURY TYPES — Mixed Models: Binary (knife/firearms), Count + Cook's D (hands/other)
+* -------------------------------------------
+local dv_list "total_inj total_inj_hands total_inj_knife total_inj_firearms total_inj_other"
+eststo clear
+
+foreach dv of local dv_list {
+    di as txt "---------------------------------------"
+    di as txt "Processing dependent variable: `dv'"
+
+    * CASE 1: Knife and Firearms — logit model, binary outcome, no Cook's D
+    if inlist("`dv'", "total_inj_knife", "total_inj_firearms") {
+        local binvar = subinstr("`dv'", "total_inj_", "binary_inj_", .)
+
+        capture drop `binvar'
+        gen `binvar' = (`dv' > 0) if !missing(`dv')
+
+        logit `binvar' z_basic_lgth_hours ib2.environment_3 z_ft_sworn z_ft_civ ///
+        i.min_ed_cat   refresher  ib3.field_man i.agency_type3 ///
+        force_based special_study  modern_study simu_1  ///
+        scenario_1  z_total_officers z_total_cleared z_total_actual , or
+		
+        estimates store m_`dv'
+        eststo m_`dv'
+
+    }
+
+    * CASE 2: Hands and Other — count model, Cook's D applied
+    else {
+        preserve
+
+        * Initial model (NBREG or Poisson)
+        quietly glm `dv' z_basic_lgth_hours ib2.environment_3 z_ft_sworn z_ft_civ ///
+        i.min_ed_cat   refresher  ib3.field_man i.agency_type3 ///
+        force_based special_study  modern_study simu_1  ///
+        scenario_1  z_total_officers z_total_cleared z_total_actual , family(nbinomial) link(log)
+
+
+        * Cook's D
+        capture drop cooksd
+        predict cooksd, cooksd
+        scalar cutoff = 4 / e(N)
+        di as txt "Cook's D cutoff (4/N) = " %6.4f cutoff
+
+        gen cleaned_`dv' = `dv'
+        replace cleaned_`dv' = . if cooksd > cutoff
+
+        tempfile temp_`dv'
+        save `temp_`dv'', replace
+
+        restore
+        use `temp_`dv'', clear
+
+        * Refit count model (NBREG or Poisson)
+        nbreg cleaned_`dv' z_basic_lgth_hours ib2.environment_3 z_ft_sworn z_ft_civ ///
+        i.min_ed_cat   refresher  ib3.field_man i.agency_type3 ///
+        force_based special_study  modern_study simu_1  ///
+        scenario_1  z_total_officers z_total_cleared z_total_actual , irr
+
+
+        estimates store m_`dv'
+        eststo m_`dv'
+
+    }
+}
