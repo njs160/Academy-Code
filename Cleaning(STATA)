@@ -1,0 +1,149 @@
+
+//////////////////////////////////////////////////////////////////////////
+
+use "/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Post-Leoka (Second)/Analysis/STATA/Full_Academy_Post_Merge_JULY31(POST).dta", clear
+
+
+*************************************************PART 1**************************************************************************
+
+//////////////////////////////////////////REMOVING UNRELIABLE OBSERVATIONS////////////////////////////////
+
+drop if ori == "."
+
+// Eliminate -8 observations to '.'
+ds, has(type numeric)
+foreach var of varlist `r(varlist)' {
+    replace `var' = . if `var' == -8 
+}
+
+//Key Identifiers of Unreliable data
+egen total_inj = rowtotal(total_inj_firearms total_inj_knife total_inj_other total_inj_hands), missing
+egen total_noninj = rowtotal(total_noninj_firearms total_noninj_knife total_noninj_other total_noninj_hands), missing
+egen total_incidents = rowtotal (total_inj total_noninj), missing
+gen total_violent = total_murder + total_robbery + total_assault + total_burglary
+
+* Drop observations where any key variable equals 0
+foreach var in total_incidents total_violent mean_officers {
+    drop if `var' == 0
+}
+
+//////////////////////////////////////////Necessary Code before Imputation//////////////////////////
+
+********// Relabeling No's as 0 instead of 2**********
+
+foreach var in refresher pat_yn judo_yn def_tac_yn fire_skill_yn nonl_yn comp_yn gang_yn comm_yn stress_yn medi_yn domv_yn victim_yn eval_post eval_stud crim_yn jjl_yn traf_law_yn study_yn com_part_yn cult_yn prob_solv_yn map_yn ethic_yn prof_yn cpr_yn emv_yn evid_yn intel_yn intero_yn inv_yn rep_yn traf_yn health_yn dui_yn emr_yn htraf_yn mental_yn opioid_yn {
+    replace `var' = 0 if `var' == 2
+}
+
+// Listing class hours as 0 if not taught
+local vars cpr comp emv evid intel intero inv pat rad rep traf judo def_tac fire_skill nonl crim jjl traf_law study com_part cult medi prob_solv map lang comm ethic health prof stress clan child cyber domv dui elder emr gang hate htraf mental opioid acsh sass shar terror victim
+
+local vars_yn  cpr_yn comp_yn emv_yn evid_yn intel_yn intero_yn inv_yn pat_yn rad_yn rep_yn traf_yn judo_yn def_tac_yn fire_skill_yn nonl_yn crim_yn jjl_yn traf_law_yn study_yn com_part_yn cult_yn medi_yn prob_solv_yn map_yn lang_yn comm_yn ethic_yn health_yn prof_yn stress_yn clan_yn child_yn cyber_yn domv_yn dui_yn elder_yn emr_yn gang_yn hate_yn htraf_yn mental_yn opioid_yn acsh_yn sass_yn shar_yn terror_yn victim_yn
+
+local nvars : word count `vars'
+forvalues i = 1/`nvars' {
+    local v : word `i' of `vars'
+    local vyn : word `i' of `vars_yn'
+    replace `v' = 0 if `vyn' == 0
+}
+
+
+*************************************************PART 2**************************************************************************
+
+
+/////////////////////////////////////////OUTCOME: LEOKA///////////////////////////////////////
+
+// ADDITION OF TOTALS ACROSS ALL TYPES
+
+* Total incidents involving firearms
+egen total_firearms = rowtotal(total_inj_firearms total_noninj_firearms), missing
+
+* Total incidents involving knives
+egen total_knife    = rowtotal(total_inj_knife    total_noninj_knife),    missing
+
+* Total incidents involving other weapons
+egen total_other    = rowtotal(total_inj_other    total_noninj_other),    missing
+
+* Total incidents involving hands (or unarmed)
+egen total_hands    = rowtotal(total_inj_hands    total_noninj_hands),    missing
+
+
+///////////////////////////////////////PREDICTOR: CLETA///////////////////////////////////////
+
+********//Standardizing basic_lgth********
+* 1. Create a new variable for standardized hours
+gen basic_lgth_hours = .
+
+* 2. Keep original if already in hours
+replace basic_lgth_hours = basic_lgth if basic_type == 1
+
+* 3. Convert weeks to hours (5 business days × 8 hours/day = 40 hours/week)
+replace basic_lgth_hours = basic_lgth * 40 if basic_type == 2
+
+* 4. Convert months to hours (4.33 weeks/month × 5 business days/week × 8 hours/day = 173.2 hours/month)
+replace basic_lgth_hours = basic_lgth * 173.2 if basic_type == 3
+
+* 5. Convert semesters to hours (3 months × 173.2 hours/month = 519.6 hours/semester)
+replace basic_lgth_hours = basic_lgth * 519.6 if basic_type == 4
+
+* 6. Handle 'Other increment' and N/A: keep as missing
+replace basic_lgth_hours = . if inlist(basic_type, 5, -8)
+
+*********// Recode minimum education var************
+gen min_ed_cat = cond(min_ed == 1, 3, cond(inlist(min_ed, 2, 3), 2, cond(inlist(min_ed, 4, 5, 6), 1, .)))
+label define min_ed_cat_lbl 1 "High school or less" 2 "College" 3 "Graduate", replace
+label values min_ed_cat min_ed_cat_lbl
+
+********// Recode Agency var************
+// Recode Agency type var/
+gen agency_type3 = cond(inlist(agencycletatype, 1,2,3,4,5), 1, cond(inlist(agencycletatype, 6,7), 2, 3))
+label define agency_type3_lbl 1 "Regular" 2 "College" 3 "Other", replace
+label values agency_type3 agency_type3_lbl
+
+********// Recoding Field Training Prerequisites**********
+	
+*Recode field_man*
+recode field_man (1=3) (2=2) (3=1)
+
+*Reverse Original Stress var/ recode ordinal var
+recode environment (1=5) (2=4) (3=3) (4=2) (5=1)
+
+********// Recoding Stress Environment**********
+
+gen environment_3 = .
+
+replace environment_3 = 1 if inlist(environment, 4, 5)
+replace environment_3 = 2 if environment == 3
+replace environment_3 = 3 if inlist(environment, 1, 2)
+label values environment_3 
+
+********// Create instructor_ratio********
+* 0. Create instructor‐to‐cadet ratio
+gen instructor_ratio = (ft_total + pt_total) / sex_start_total
+label variable instructor_ratio 
+
+********// Curricula Coding*********
+
+
+// 1️⃣ Create total training hours across selected subjects
+egen total_studyhours = rowtotal(crim jjl traf_law study com_part cult medi prob_solv map comm ethic prof stress cpr comp emv evid intel intero inv pat rep traf judo def_tac fire_skill nonl opioid mental htraf emr dui gang)
+
+********//Fail Metrics*******
+gen eth_completion_rate = eth_comp_total / eth_start_total
+
+gen fail_total = fail_total_m + fail_total_f
+
+gen fail_phys_total= fail_phys_m + fail_phys_f
+
+gen fail_academic_total= fail_acad_m + fail_acad_f
+
+********//Firearm Range recode*******
+
+gen firerange = (in_fire_1 == 1 | out_fire_1 == 1)
+
+///////////////////////////////////////CONTROL: UCR data////////////////////////
+
+gen total_clearviolent = total_cleared_murder + total_cleared_robbery + total_cleared_assault +total_cleared_burglary
+
+gen violentclearance_rate = .
+replace violentclearance_rate = (total_clearviolent / total_violent) * 100 if total_violent > 0
