@@ -1,0 +1,225 @@
+# Load required libraries
+library(haven)      # For reading Stata files
+library(dplyr)      # For data manipulation
+library(mice)       # For multiple imputation
+library(car)        # For recoding functions
+
+# Install missing packages if needed
+if (!require(psych)) install.packages("psych")
+library(psych)      # For factor analysis
+
+##########################################################################
+# PART 1: Data Loading and Cleaning
+##########################################################################
+
+# Load the data
+data <- read_dta("/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Post-Leoka (Second)/Analysis/STATA/Full_Academy_Post_Merge_JULY31(POST).dta")
+
+###################################### REMOVING UNRELIABLE OBSERVATIONS ######################################
+
+# Drop observations where ori == "."
+data <- data[data$ori != ".", ]
+
+# Replace -8 with NA in all numeric variables
+numeric_vars <- sapply(data, is.numeric)
+data[numeric_vars] <- lapply(data[numeric_vars], function(x) ifelse(x == -8, NA, x))
+
+# Key Identifiers of Unreliable data
+data$total_inj <- rowSums(data[c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands")], na.rm = FALSE)
+data$total_noninj <- rowSums(data[c("total_noninj_firearms", "total_noninj_knife", "total_noninj_other", "total_noninj_hands")], na.rm = FALSE)
+data$total_incidents <- rowSums(data[c("total_inj", "total_noninj")], na.rm = FALSE)
+data$total_violent <- data$total_murder + data$total_robbery + data$total_assault + data$total_burglary
+
+# Drop observations where key variables equal 0
+data <- data[!(data$total_incidents == 0 | data$total_violent == 0 | data$mean_officers == 0), ]
+
+###################################### Necessary Code before Imputation ######################################
+
+# Relabeling No's as 0 instead of 2
+binary_vars <- c("refresher", "pat_yn", "judo_yn", "def_tac_yn", "fire_skill_yn", "nonl_yn", 
+                 "comp_yn", "gang_yn", "comm_yn", "stress_yn", "medi_yn", "domv_yn", "victim_yn", 
+                 "eval_post", "eval_stud", "crim_yn", "jjl_yn", "traf_law_yn", "study_yn", 
+                 "com_part_yn", "cult_yn", "prob_solv_yn", "map_yn", "ethic_yn", "prof_yn", 
+                 "cpr_yn", "emv_yn", "evid_yn", "intel_yn", "intero_yn", "inv_yn", "rep_yn", 
+                 "traf_yn", "health_yn", "dui_yn", "emr_yn", "htraf_yn", "mental_yn", "opioid_yn")
+
+for(var in binary_vars) {
+  if(var %in% names(data)) {
+    data[[var]][data[[var]] == 2] <- 0
+  }
+}
+
+# Listing class hours as 0 if not taught
+vars <- c("cpr", "comp", "emv", "evid", "intel", "intero", "inv", "pat", "rad", "rep", "traf", 
+          "judo", "def_tac", "fire_skill", "nonl", "crim", "jjl", "traf_law", "study", 
+          "com_part", "cult", "medi", "prob_solv", "map", "lang", "comm", "ethic", "health", 
+          "prof", "stress", "clan", "child", "cyber", "domv", "dui", "elder", "emr", "gang", 
+          "hate", "htraf", "mental", "opioid", "acsh", "sass", "shar", "terror", "victim")
+
+vars_yn <- paste0(vars, "_yn")
+
+for(i in seq_along(vars)) {
+  if(vars[i] %in% names(data) && vars_yn[i] %in% names(data)) {
+    data[[vars[i]]][data[[vars_yn[i]]] == 0] <- 0
+  }
+}
+
+# Standardizing basic_lgth
+data$basic_lgth_hours <- NA
+
+# Keep original if already in hours - handle NAs properly
+mask1 <- !is.na(data$basic_type) & data$basic_type == 1
+data$basic_lgth_hours[mask1] <- data$basic_lgth[mask1]
+
+# Convert weeks to hours (5 business days × 8 hours/day = 40 hours/week)
+mask2 <- !is.na(data$basic_type) & data$basic_type == 2
+data$basic_lgth_hours[mask2] <- data$basic_lgth[mask2] * 40
+
+# Convert months to hours (4.33 weeks/month × 5 business days/week × 8 hours/day = 173.2 hours/month)
+mask3 <- !is.na(data$basic_type) & data$basic_type == 3
+data$basic_lgth_hours[mask3] <- data$basic_lgth[mask3] * 173.2
+
+# Convert semesters to hours (3 months × 173.2 hours/month = 519.6 hours/semester)
+mask4 <- !is.na(data$basic_type) & data$basic_type == 4
+data$basic_lgth_hours[mask4] <- data$basic_lgth[mask4] * 519.6
+
+# Handle 'Other increment' and N/A: keep as missing
+mask5 <- !is.na(data$basic_type) & data$basic_type %in% c(5, -8)
+data$basic_lgth_hours[mask5] <- NA
+
+# Two-level education indicator: 0 = High school or less; 1 = College or higher
+data$min_ed_bin <- ifelse(data$min_ed %in% c(1,2,3), 1,
+                         ifelse(data$min_ed %in% c(4,5,6), 0, NA))
+
+# Recode Agency type var
+data$agency_type3 <- ifelse(data$agencycletatype %in% c(1,2,3,4,5), 1,
+                           ifelse(data$agencycletatype %in% c(6,7), 2, 3))
+
+# Recoding Field Training Prerequisites
+# Recode field_man
+data$field_man <- car::recode(data$field_man, "1=3; 2=2; 3=1")
+
+# Reverse Original Stress var/ recode ordinal var
+data$environment <- car::recode(data$environment, "1=5; 2=4; 3=3; 4=2; 5=1")
+
+# Recoding Stress Environment
+data$environment_3 <- NA
+data$environment_3[data$environment %in% c(4, 5)] <- 1
+data$environment_3[data$environment == 3] <- 2
+data$environment_3[data$environment %in% c(1, 2)] <- 3
+
+#####################################################################################
+# IMPUTATION
+#####################################################################################
+
+# Prepare data for multiple imputation
+# Select variables for imputation
+impute_vars <- c("fitness_1", "obstacle_1", "in_fire_1", "out_fire_1", "scenario_1", 
+                 "refresher", "field_man", "environment_3", "agency_type3", "min_ed_bin", "statecode",
+                 "basic_lgth_hours", "ft_sworn", "ft_civ", "ebudget", "opbudget", 
+                 "mean_officers", "ft_total", "pt_total", "sex_start_total")
+
+predictor_vars <- c("total_inj_firearms", "total_noninj_firearms", "total_inj_knife", 
+                    "total_noninj_knife", "total_inj_other", "total_noninj_other", 
+                    "total_inj_hands", "total_noninj_hands")
+
+# Create subset for imputation
+impute_data <- data[c(impute_vars, predictor_vars)]
+
+# Set up mice imputation
+init <- mice(impute_data, maxit = 0, printFlag = FALSE)
+predM <- init$predictorMatrix
+meth <- init$method
+
+# Set predictor matrix (use predictor variables to predict missing values)
+predM[impute_vars, predictor_vars] <- 1
+predM[predictor_vars, ] <- 0  # Don't impute predictor variables
+
+# Check variable types and set appropriate methods
+# Convert categorical variables to factors first
+categorical_vars <- c("fitness_1", "obstacle_1", "in_fire_1", "out_fire_1", "scenario_1", 
+                     "refresher", "min_ed_bin", "field_man", "environment_3", "agency_type3")
+
+for(var in categorical_vars) {
+  if(var %in% names(impute_data)) {
+    impute_data[[var]] <- as.factor(impute_data[[var]])
+  }
+}
+
+# Set methods for different variable types
+continuous_vars <- c("basic_lgth_hours", "ft_sworn", "ft_civ", "ebudget", "opbudget", 
+                     "mean_officers", "ft_total", "pt_total", "sex_start_total")
+binary_vars <- c("fitness_1", "obstacle_1", "in_fire_1", "out_fire_1", "scenario_1", 
+                 "refresher", "min_ed_bin")
+multi_vars <- c("field_man", "environment_3", "agency_type3")
+
+meth[continuous_vars[continuous_vars %in% names(impute_data)]] <- "pmm"
+meth[binary_vars[binary_vars %in% names(impute_data)]] <- "logreg"
+meth[multi_vars[multi_vars %in% names(impute_data)]] <- "polyreg"
+
+# Re-initialize with corrected data
+init <- mice(impute_data, maxit = 0, printFlag = FALSE)
+predM <- init$predictorMatrix
+meth <- init$method
+
+# Reset methods
+meth[continuous_vars[continuous_vars %in% names(impute_data)]] <- "pmm"
+meth[binary_vars[binary_vars %in% names(impute_data)]] <- "logreg"
+meth[multi_vars[multi_vars %in% names(impute_data)]] <- "polyreg"
+
+# Set predictor matrix again
+predM[impute_vars, predictor_vars] <- 1
+predM[predictor_vars, ] <- 0
+
+# Perform first imputation
+imp1 <- mice(impute_data, method = meth, predictorMatrix = predM, 
+             m = 20, maxit = 10, seed = 12345, printFlag = TRUE)
+
+# Get first set of imputed data
+data_imp1 <- complete(imp1, "long", include = TRUE)
+
+# Second set of variables for imputation
+second_impute_vars <- c("crim", "jjl", "traf_law", "study", "com_part", "cult", "medi", 
+                        "prob_solv", "map", "comm", "ethic", "prof", "stress", "cpr",
+                        "comp", "emv", "evid", "intel", "intero", "inv", "pat", "rep", 
+                        "traf", "judo", "def_tac", "fire_skill", "nonl", "victim", 
+                        "domv", "opioid", "mental", "htraf", "emr", "dui", "gang",
+                        "total_violent", "total_cleared_murder", "total_cleared_robbery", 
+                        "total_cleared_assault", "total_cleared_burglary",
+                        "fail_phys_m", "fail_phys_f", "fail_acad_m", "fail_acad_f", 
+                        "eth_comp_total", "eth_start_total", "fail_total_m", "fail_total_f")
+
+# Add second set to imputation data
+all_impute_vars <- c(impute_vars, second_impute_vars)
+full_impute_data <- data[c(all_impute_vars, predictor_vars)]
+
+# Second imputation setup
+init2 <- mice(full_impute_data, maxit = 0)
+predM2 <- init2$predictorMatrix
+meth2 <- init2$method
+
+# Set all second set variables to use pmm (predictive mean matching)
+meth2[second_impute_vars] <- "pmm"
+
+# Perform second imputation
+imp2 <- mice(full_impute_data, method = meth2, predictorMatrix = predM2, 
+             m = 20, maxit = 10, seed = 12345, printFlag = TRUE)
+
+# Get final imputed data
+data_imputed <- complete(imp2, "long", include = TRUE)
+
+# Save the imputed dataset at the end of Part 1
+save_path <- "/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Post-Leoka (Second)/Analysis/R/"
+dir.create(save_path, recursive = TRUE, showWarnings = FALSE)  # Create directory if it doesn't exist
+
+# Save as R data file (recommended for preserving all data types)
+save(data_imputed, imp2, file = paste0(save_path, "Post_ImputedAug2_R.RData"))
+
+# Also save as CSV for compatibility (since .dta has issues with variable names starting with .)
+write.csv(data_imputed, paste0(save_path, "Post_ImputedAug2_R.csv"), row.names = FALSE)
+
+print("=== END OF PART 1: IMPUTATION COMPLETE ===")
+print(paste("Imputed data saved to:", save_path))
+print(paste("Number of imputations:", max(data_imputed$.imp)))
+print(paste("Number of observations per imputation:", nrow(data_imputed[data_imputed$.imp == 1, ])))
+
