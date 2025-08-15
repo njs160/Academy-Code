@@ -1,0 +1,474 @@
+# FINALIZED COMPREHENSIVE MODELS
+# ==============================
+
+# First ensure region is included in predictors if not already
+if("region" %in% names(data_final) && !"region" %in% preds_full) {
+  preds_full_with_region <- c(preds_full, "region")
+} else {
+  preds_full_with_region <- preds_full
+}
+
+# Store finalized results
+finalized_nb_results <- list()
+
+# Define outcomes
+injury_outcomes <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries")
+incident_outcomes <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", "cleaned_total_hands", "cleaned_total_incidents")
+
+# Run all models with full predictor set including region
+cat("\n", strrep("=", 80), "\n")
+cat("RUNNING FINALIZED COMPREHENSIVE MODELS WITH REGIONAL EFFECTS\n")
+cat(strrep("=", 80), "\n")
+
+# 1. INJURY MODELS
+cat("\n>>> FINALIZED INJURY MODELS <<<\n")
+for(outcome in injury_outcomes) {
+  if(outcome %in% names(data_final)) {
+    cat("\nAnalyzing:", outcome, "\n")
+    nb_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_full_with_region)
+    if(!is.null(nb_result)) {
+      finalized_nb_results[[outcome]] <- nb_result
+      cat("  ✓ Model completed. McFadden R²:", round(nb_result$pseudo_r2$mcfadden, 4), "\n")
+    }
+  }
+}
+
+# 2. INCIDENT MODELS (Cook's D cleaned)
+cat("\n>>> FINALIZED INCIDENT MODELS (Cook's D Cleaned) <<<\n")
+for(outcome in incident_outcomes) {
+  if(outcome %in% names(data_final)) {
+    cat("\nAnalyzing:", outcome, "\n")
+    nb_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_full_with_region)
+    if(!is.null(nb_result)) {
+      finalized_nb_results[[outcome]] <- nb_result
+      cat("  ✓ Model completed. McFadden R²:", round(nb_result$pseudo_r2$mcfadden, 4), "\n")
+    }
+  }
+}
+
+# FUNCTION TO CREATE FINALIZED TABLES
+create_finalized_table <- function(results_list, outcome_type = "Injury") {
+  
+  # Define the exact order and names of predictors
+  predictor_order <- c(
+    "ACADEMY STRUCTURE",
+    "(Intercept)|Intercept",
+    "z_basic_lgth_hours|Basic Training Length",
+    "field_man1|Field Training: Mandatory for Some",
+    "field_man2|Field Training: Mandatory for All",
+    "environment_31|Self Reported Stress: Low",
+    "environment_33|Self Reported Stress: High",
+    "z_ebudget|Equipment Budget",
+    "z_opbudget|Operational Budget",
+    "agency_type3College|Overseeing Agency: College",
+    "agency_type3Other|Overseeing Agency: Other",
+    "fitness_1|Fitness Center",
+    "obstacle_1|Obstacle Courses",
+    "firerange|Firing Range",
+    "scenario_1|Scenario Training",
+    "z_fail_phys_total|Total Failed: Physical",
+    "z_fail_academic_total|Total Failed: Academic",
+    "",
+    "ACADEMY CURRICULA",
+    "force_based|Force-Based Training",
+    "contemporary_policing|Contemporary Policing",
+    "special_study|Special Topics",
+    "z_ft_sworn|Full-time Sworn Instructors",
+    "z_ft_civ|Full-time Civilian Instructors",
+    "min_ed_bin|Instructor Min. Education (College+)",
+    "refresher|Instructor Refresher Courses",
+    "",
+    "CONTROLS",
+    "z_mean_officers|Average Officers",
+    "z_total_violent|Total Violent Crime",
+    "violentclearance_rate|Violent Crime Clearance Rate",
+    "regionNortheast|Region: Northeast",
+    "regionMidwest|Region: Midwest",
+    "regionWest|Region: West"
+  )
+  
+  # Filter results by outcome type
+  if(outcome_type == "Injury") {
+    model_names <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", 
+                    "total_inj_hands", "total_injuries")
+  } else {
+    model_names <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", 
+                    "cleaned_total_hands", "cleaned_total_incidents")
+  }
+  
+  # Keep only models that exist
+  model_names <- model_names[model_names %in% names(results_list)]
+  
+  # Start building the table
+  cat("\n\n", strrep("=", 130), "\n")
+  cat(paste("FINALIZED", toupper(outcome_type), "MODELS - COMPREHENSIVE RESULTS\n"))
+  cat(strrep("=", 130), "\n\n")
+  
+  # Header
+  cat(sprintf("%-45s", ""))
+  for(model in model_names) {
+    short_name <- gsub("total_inj_|cleaned_total_|total_", "", model)
+    short_name <- stringr::str_to_title(short_name)
+    cat(sprintf(" %20s", short_name))
+  }
+  cat("\n")
+  
+  cat(sprintf("%-45s", "Predictor"))
+  for(model in model_names) {
+    cat(sprintf(" %10s %9s", "IRR", "95% CI"))
+  }
+  cat("\n")
+  cat(strrep("-", 130), "\n")
+  
+  # Process each predictor
+  for(pred_entry in predictor_order) {
+    if(pred_entry == "") {
+      cat("\n")  # Blank line
+      next
+    }
+    
+    # Check if it's a section header
+    if(pred_entry %in% c("ACADEMY STRUCTURE", "ACADEMY CURRICULA", "CONTROLS")) {
+      cat(sprintf("\n%-45s\n", pred_entry))
+      next
+    }
+    
+    # Split predictor code and label
+    parts <- strsplit(pred_entry, "\\|")[[1]]
+    if(length(parts) == 2) {
+      pred_code <- parts[1]
+      pred_label <- parts[2]
+    } else {
+      pred_code <- pred_entry
+      pred_label <- pred_entry
+    }
+    
+    # Print the row
+    cat(sprintf("%-45s", pred_label))
+    
+    for(model in model_names) {
+      if(!is.null(results_list[[model]])) {
+        summary_df <- results_list[[model]]$summary
+        pred_row <- summary_df[summary_df$term == pred_code, ]
+        
+        if(nrow(pred_row) > 0) {
+          # Format IRR with significance
+          irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
+          # Format CI
+          ci_str <- sprintf("(%.2f-%.2f)", pred_row$IRR.lower[1], pred_row$IRR.upper[1])
+          cat(sprintf(" %10s %9s", irr_str, ci_str))
+        } else {
+          cat(sprintf(" %10s %9s", "-", "-"))
+        }
+      } else {
+        cat(sprintf(" %10s %9s", "NA", "NA"))
+      }
+    }
+    cat("\n")
+  }
+  
+  # Model fit statistics
+  cat("\n")
+  cat(strrep("-", 130), "\n")
+  cat("Model Fit Statistics:\n")
+  
+  # McFadden R²
+  cat(sprintf("%-45s", "  McFadden R²"))
+  for(model in model_names) {
+    if(!is.null(results_list[[model]])) {
+      cat(sprintf(" %20.3f", results_list[[model]]$pseudo_r2$mcfadden))
+    } else {
+      cat(sprintf(" %20s", "NA"))
+    }
+  }
+  cat("\n")
+  
+  # Nagelkerke R²
+  cat(sprintf("%-45s", "  Nagelkerke R²"))
+  for(model in model_names) {
+    if(!is.null(results_list[[model]])) {
+      cat(sprintf(" %20.3f", results_list[[model]]$pseudo_r2$nagelkerke))
+    } else {
+      cat(sprintf(" %20s", "NA"))
+    }
+  }
+  cat("\n")
+  
+  # AIC
+  cat(sprintf("%-45s", "  AIC"))
+  for(model in model_names) {
+    if(!is.null(results_list[[model]])) {
+      cat(sprintf(" %20.1f", results_list[[model]]$avg_aic))
+    } else {
+      cat(sprintf(" %20s", "NA"))
+    }
+  }
+  cat("\n")
+  
+  # Sample size
+  cat(sprintf("%-45s", "  N"))
+  for(model in model_names) {
+    if(!is.null(results_list[[model]])) {
+      cat(sprintf(" %20.0f", results_list[[model]]$n_obs))
+    } else {
+      cat(sprintf(" %20s", "NA"))
+    }
+  }
+  cat("\n")
+  
+  cat(strrep("-", 130), "\n")
+  cat("Reference categories: Field Training (None), Stress (Medium), Agency (Regular), Region (South)\n")
+  cat("*** p<0.001, ** p<0.01, * p<0.05, † p<0.1\n")
+  cat("All continuous predictors are z-score standardized\n")
+  if(outcome_type == "Incident") {
+    cat("Incident models use Cook's D cleaned outcomes\n")
+  }
+}
+
+# Generate finalized tables
+create_finalized_table(finalized_nb_results, "Injury")
+create_finalized_table(finalized_nb_results, "Incident")
+
+# CREATE SUMMARY OF KEY FINDINGS
+cat("\n\n", strrep("=", 80), "\n")
+cat("SUMMARY OF KEY FINDINGS\n")
+cat(strrep("=", 80), "\n")
+
+# Function to extract significant predictors
+extract_significant_predictors <- function(results_list, p_threshold = 0.05) {
+  sig_summary <- list()
+  
+  for(outcome in names(results_list)) {
+    if(!is.null(results_list[[outcome]])) {
+      summary_df <- results_list[[outcome]]$summary
+      sig_preds <- summary_df[summary_df$p.value < p_threshold & summary_df$term != "(Intercept)", ]
+      
+      if(nrow(sig_preds) > 0) {
+        # Categorize by direction
+        protective <- sig_preds[sig_preds$IRR < 1, c("term", "IRR", "p.value")]
+        risk <- sig_preds[sig_preds$IRR > 1, c("term", "IRR", "p.value")]
+        
+        sig_summary[[outcome]] <- list(
+          protective = protective,
+          risk = risk,
+          r2 = results_list[[outcome]]$pseudo_r2$mcfadden
+        )
+      }
+    }
+  }
+  
+  return(sig_summary)
+}
+
+# Extract significant findings
+sig_findings <- extract_significant_predictors(finalized_nb_results)
+
+# Print summary for injuries
+cat("\n--- INJURY MODELS: SIGNIFICANT PREDICTORS ---\n")
+injury_outcomes_clean <- c("Firearms", "Knife", "Other", "Hands", "Total")
+names(injury_outcomes_clean) <- injury_outcomes
+
+for(i in 1:length(injury_outcomes)) {
+  outcome <- injury_outcomes[i]
+  if(outcome %in% names(sig_findings)) {
+    cat("\n", injury_outcomes_clean[i], "Injuries (R² =", 
+        round(sig_findings[[outcome]]$r2, 3), "):\n")
+    
+    if(nrow(sig_findings[[outcome]]$protective) > 0) {
+      cat("  Protective factors:\n")
+      for(j in 1:nrow(sig_findings[[outcome]]$protective)) {
+        row <- sig_findings[[outcome]]$protective[j, ]
+        cat(sprintf("    - %s: IRR = %.3f%s\n", 
+                   row$term, row$IRR,
+                   ifelse(row$p.value < 0.001, "***",
+                         ifelse(row$p.value < 0.01, "**",
+                               ifelse(row$p.value < 0.05, "*", "")))))
+      }
+    }
+    
+    if(nrow(sig_findings[[outcome]]$risk) > 0) {
+      cat("  Risk factors:\n")
+      for(j in 1:nrow(sig_findings[[outcome]]$risk)) {
+        row <- sig_findings[[outcome]]$risk[j, ]
+        cat(sprintf("    - %s: IRR = %.3f%s\n", 
+                   row$term, row$IRR,
+                   ifelse(row$p.value < 0.001, "***",
+                         ifelse(row$p.value < 0.01, "**",
+                               ifelse(row$p.value < 0.05, "*", "")))))
+      }
+    }
+  }
+}
+
+# Print summary for incidents
+cat("\n\n--- INCIDENT MODELS: SIGNIFICANT PREDICTORS ---\n")
+incident_outcomes_clean <- c("Firearms", "Knife", "Other", "Hands", "Total")
+names(incident_outcomes_clean) <- incident_outcomes
+
+for(i in 1:length(incident_outcomes)) {
+  outcome <- incident_outcomes[i]
+  if(outcome %in% names(sig_findings)) {
+    cat("\n", incident_outcomes_clean[i], "Incidents (R² =", 
+        round(sig_findings[[outcome]]$r2, 3), "):\n")
+    
+    if(nrow(sig_findings[[outcome]]$protective) > 0) {
+      cat("  Protective factors:\n")
+      for(j in 1:nrow(sig_findings[[outcome]]$protective)) {
+        row <- sig_findings[[outcome]]$protective[j, ]
+        cat(sprintf("    - %s: IRR = %.3f%s\n", 
+                   row$term, row$IRR,
+                   ifelse(row$p.value < 0.001, "***",
+                         ifelse(row$p.value < 0.01, "**",
+                               ifelse(row$p.value < 0.05, "*", "")))))
+      }
+    }
+    
+    if(nrow(sig_findings[[outcome]]$risk) > 0) {
+      cat("  Risk factors:\n")
+      for(j in 1:nrow(sig_findings[[outcome]]$risk)) {
+        row <- sig_findings[[outcome]]$risk[j, ]
+        cat(sprintf("    - %s: IRR = %.3f%s\n", 
+                   row$term, row$IRR,
+                   ifelse(row$p.value < 0.001, "***",
+                         ifelse(row$p.value < 0.01, "**",
+                               ifelse(row$p.value < 0.05, "*", "")))))
+      }
+    }
+  }
+}
+
+# EXPORT FINALIZED RESULTS TO CSV
+create_excel_friendly_table <- function(results_list, outcome_type, save_path) {
+  
+  # Initialize the output dataframe
+  output_df <- data.frame(
+    Section = character(),
+    Predictor = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Define sections and predictors
+  sections <- list(
+    "ACADEMY STRUCTURE" = list(
+      "(Intercept)" = "Intercept",
+      "z_basic_lgth_hours" = "Basic Training Length",
+      "field_man1" = "Field Training: Mandatory for Some",
+      "field_man2" = "Field Training: Mandatory for All",
+      "environment_31" = "Self Reported Stress: Low",
+      "environment_33" = "Self Reported Stress: High",
+      "z_ebudget" = "Equipment Budget",
+      "z_opbudget" = "Operational Budget",
+      "agency_type3College" = "Overseeing Agency: College",
+      "agency_type3Other" = "Overseeing Agency: Other",
+      "fitness_1" = "Fitness Center",
+      "obstacle_1" = "Obstacle Courses",
+      "firerange" = "Firing Range",
+      "scenario_1" = "Scenario Training",
+      "z_fail_phys_total" = "Total Failed: Physical",
+      "z_fail_academic_total" = "Total Failed: Academic"
+    ),
+    "ACADEMY CURRICULA" = list(
+      "force_based" = "Force-Based Training",
+      "contemporary_policing" = "Contemporary Policing",
+      "special_study" = "Special Topics",
+      "z_ft_sworn" = "Full-time Sworn Instructors",
+      "z_ft_civ" = "Full-time Civilian Instructors",
+      "min_ed_bin" = "Instructor Min. Education (College+)",
+      "refresher" = "Instructor Refresher Courses"
+    ),
+    "CONTROLS" = list(
+      "z_mean_officers" = "Average Officers",
+      "z_total_violent" = "Total Violent Crime",
+      "violentclearance_rate" = "Violent Crime Clearance Rate",
+      "regionNortheast" = "Region: Northeast",
+      "regionMidwest" = "Region: Midwest",
+      "regionWest" = "Region: West"
+    )
+  )
+  
+  # Build rows
+  row_num <- 1
+  for(section_name in names(sections)) {
+    for(pred_code in names(sections[[section_name]])) {
+      output_df[row_num, "Section"] <- section_name
+      output_df[row_num, "Predictor"] <- sections[[section_name]][[pred_code]]
+      
+      # Add columns for each outcome
+      if(outcome_type == "Injury") {
+        outcomes <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", 
+                     "total_inj_hands", "total_injuries")
+      } else {
+        outcomes <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", 
+                     "cleaned_total_hands", "cleaned_total_incidents")
+      }
+      
+      for(outcome in outcomes) {
+        col_name <- gsub("total_inj_|cleaned_total_|total_", "", outcome)
+        col_name <- paste0(stringr::str_to_title(col_name), "_IRR")
+        col_name_ci <- paste0(stringr::str_to_title(gsub("total_inj_|cleaned_total_|total_", "", outcome)), "_95CI")
+        
+        if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
+          summary_df <- results_list[[outcome]]$summary
+          pred_row <- summary_df[summary_df$term == pred_code, ]
+          
+          if(nrow(pred_row) > 0) {
+            output_df[row_num, col_name] <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
+            output_df[row_num, col_name_ci] <- sprintf("(%.2f-%.2f)", pred_row$IRR.lower[1], pred_row$IRR.upper[1])
+          } else {
+            output_df[row_num, col_name] <- "-"
+            output_df[row_num, col_name_ci] <- "-"
+          }
+        }
+      }
+      row_num <- row_num + 1
+    }
+  }
+  
+  # Add model fit statistics
+  fit_stats <- data.frame(
+    Section = "MODEL FIT",
+    Predictor = c("McFadden R²", "Nagelkerke R²", "AIC", "N"),
+    stringsAsFactors = FALSE
+  )
+  
+  for(outcome in outcomes) {
+    col_name <- paste0(stringr::str_to_title(gsub("total_inj_|cleaned_total_|total_", "", outcome)), "_IRR")
+    col_name_ci <- paste0(stringr::str_to_title(gsub("total_inj_|cleaned_total_|total_", "", outcome)), "_95CI")
+    
+    if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
+      fit_stats[1, col_name] <- sprintf("%.3f", results_list[[outcome]]$pseudo_r2$mcfadden)
+      fit_stats[2, col_name] <- sprintf("%.3f", results_list[[outcome]]$pseudo_r2$nagelkerke)
+      fit_stats[3, col_name] <- sprintf("%.1f", results_list[[outcome]]$avg_aic)
+      fit_stats[4, col_name] <- as.character(results_list[[outcome]]$n_obs)
+      
+      fit_stats[, col_name_ci] <- ""
+    }
+  }
+  
+  output_df <- rbind(output_df, fit_stats)
+  
+  # Save to CSV
+  filename <- paste0(save_path, "finalized_", tolower(outcome_type), "_models_results.csv")
+  write.csv(output_df, filename, row.names = FALSE)
+  cat("\n✓ Saved", outcome_type, "results to:", filename, "\n")
+  
+  return(output_df)
+}
+
+# Export both tables
+injury_table_final <- create_excel_friendly_table(finalized_nb_results, "Injury", save_path)
+incident_table_final <- create_excel_friendly_table(finalized_nb_results, "Incident", save_path)
+
+cat("\n\n", strrep("=", 80), "\n")
+cat("ANALYSIS COMPLETE\n")
+cat(strrep("=", 80), "\n")
+cat("\nFiles created:\n")
+cat("  - finalized_injury_models_results.csv\n")
+cat("  - finalized_incident_models_results.csv\n")
+cat("\nThese tables include:\n")
+cat("  - IRRs with significance indicators\n")
+cat("  - 95% Confidence Intervals\n")
+cat("  - Model fit statistics (McFadden R², Nagelkerke R², AIC)\n")
+cat("  - Sample sizes\n")
+cat("  - Regional effects (Northeast, Midwest, West vs. South)\n")
+cat("\nIncident models use Cook's D cleaned outcomes.\n")
