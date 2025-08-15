@@ -1,0 +1,244 @@
+# //////////////////////////////////////ORI/OFFICER INJURY MERGE (2018–2022)///////////////////////////////////////
+
+# Load libraries
+library(haven)
+library(readr)
+library(dplyr)
+library(stringr)
+library(fuzzyjoin)
+library(stringdist)
+library(writexl)
+
+# 1. Read and prepare roimatch1 and manual academy lookup
+roimatch1 <- read_csv("~/Downloads/roimatch1.csv", show_col_types = FALSE) %>%
+  rename(state_orig = statecode) %>%
+  mutate(clean_academy = str_to_lower(academyname))
+
+# 1a. Manual city mappings for known exceptions
+academy_lookup <- c(
+  "university of alaska fairbanks community and technical" = "FAIRBANKS NORTH STAR BOROUGH",
+  "alaska of public safety" = "SITKA",
+  "lubbock police department" = "LUBBOCK"
+)
+
+# 2. Clean roimatch1 academy names
+roimatch1_clean <- roimatch1 %>%
+  mutate(
+    matched_city = academy_lookup[clean_academy],
+    clean_academy = academyname %>%
+      str_to_lower() %>%
+      str_replace_all("\\b(police|training|academy|department|college|state|county|regional)\\b", " ") %>%
+      str_replace_all("[^a-z]", " ") %>%
+      str_squish()
+  )
+
+# 3. Define variables to select
+vars_to_select <- c(
+  "V3", "V9", "V10", "V11", "V12", "V14", "V15", "V18",
+  paste0("V", c(74, 257, 440, 623, 806, 989, 1172, 1355, 1538, 1721, 1904, 2087)),  # inj_firearms
+  paste0("V", c(75, 258, 441, 624, 807, 990, 1173, 1356, 1539, 1722, 1905, 2088)),  # inj_knife
+  paste0("V", c(76, 259, 442, 625, 808, 991, 1174, 1357, 1540, 1723, 1906, 2089)),  # inj_other
+  paste0("V", c(77, 260, 443, 626, 809, 992, 1175, 1358, 1541, 1724, 1907, 2090)),  # inj_hands
+  paste0("V", c(79, 262, 445, 628, 811, 994, 1177, 1360, 1543, 1726, 1909, 2092)),  # noninj_firearms
+  paste0("V", c(80, 263, 446, 629, 812, 995, 1178, 1361, 1544, 1727, 1910, 2093)),  # noninj_knife
+  paste0("V", c(81, 264, 447, 630, 813, 996, 1179, 1362, 1545, 1728, 1911, 2094)),  # noninj_other
+  paste0("V", c(82, 265, 448, 631, 814, 997, 1180, 1363, 1546, 1729, 1912, 2095)),  # noninj_hands
+  paste0("V", c(72, 150, 333, 516, 699, 882, 1065, 1248, 1431, 1614, 1797, 1980)),  # killed_felonious
+  paste0("V", c(73, 151, 334, 517, 700, 883, 1066, 1249, 1432, 1615, 1798, 1981)),  # killed_accidental
+  paste0("V", c(83, 266, 449, 632, 815, 998, 1181, 1364, 1547, 1730, 1913, 2096)),  # asslt_disturbance
+  paste0("V", c(84, 267, 450, 633, 816, 999, 1182, 1365, 1548, 1731, 1914, 2097)),  # asslt_burglary
+  paste0("V", c(85, 268, 451, 634, 817, 1000, 1183, 1366, 1549, 1732, 1915, 2098)), # asslt_robbery
+  paste0("V", c(86, 269, 452, 635, 818, 1001, 1184, 1367, 1550, 1733, 1916, 2099)), # asslt_civildis
+  paste0("V", c(87, 270, 453, 636, 819, 1002, 1185, 1368, 1551, 1734, 1917, 2100)), # asslt_suspicious
+  paste0("V", c(88, 271, 454, 637, 820, 1003, 1186, 1369, 1552, 1735, 1918, 2101)), # asslt_ambush
+  paste0("V", c(89, 272, 455, 638, 821, 1004, 1187, 1370, 1553, 1736, 1919, 2102))  # asslt_traffic
+)
+
+# 4. Initialize list
+enriched_list <- list()
+
+# 5. Loop through each year
+for (yr in 2018:2022) {
+  message("\nProcessing police_", yr, ".dta ...")
+
+  # 5a. Read LEOKA data
+  LEOK_data <- read_dta(sprintf("~/Downloads/police_%d.dta", yr)) %>%
+    select(all_of(vars_to_select)) %>%
+    mutate(
+      total_officers = as.numeric(V12) + as.numeric(V14),
+      ori = V3,
+      city = V10,
+      state_nom = V11,
+      population_served = V14,
+      statecode = toupper(substr(V3, 1, 2))
+    ) %>%
+    mutate(
+      total_inj_firearms     = rowSums(across(starts_with("V74")), na.rm = TRUE),
+      total_inj_knife        = rowSums(across(starts_with("V75")), na.rm = TRUE),
+      total_inj_other        = rowSums(across(starts_with("V76")), na.rm = TRUE),
+      total_inj_hands        = rowSums(across(starts_with("V77")), na.rm = TRUE),
+      total_noninj_firearms  = rowSums(across(starts_with("V79")), na.rm = TRUE),
+      total_noninj_knife     = rowSums(across(starts_with("V80")), na.rm = TRUE),
+      total_noninj_other     = rowSums(across(starts_with("V81")), na.rm = TRUE),
+      total_noninj_hands     = rowSums(across(starts_with("V82")), na.rm = TRUE),
+      total_killed_felonious = rowSums(across(starts_with("V72")), na.rm = TRUE),
+      total_killed_accidental= rowSums(across(starts_with("V73")), na.rm = TRUE),
+      total_asslt_disturbance = rowSums(across(starts_with("V83")), na.rm = TRUE),
+      total_asslt_burglary    = rowSums(across(starts_with("V84")), na.rm = TRUE),
+      total_asslt_robbery     = rowSums(across(starts_with("V85")), na.rm = TRUE),
+      total_asslt_civildis    = rowSums(across(starts_with("V86")), na.rm = TRUE),
+      total_asslt_suspicious  = rowSums(across(starts_with("V87")), na.rm = TRUE),
+      total_asslt_ambush      = rowSums(across(starts_with("V88")), na.rm = TRUE),
+      total_asslt_traffic     = rowSums(across(starts_with("V89")), na.rm = TRUE)
+    )
+
+  # 5b. Clean city names for join
+  LEOK_clean <- LEOK_data %>%
+    mutate(
+      clean_city = city %>%
+        str_to_lower() %>%
+        str_replace_all("\\b(city|county)\\b", " ") %>%
+        str_replace_all("[^a-z]", " ") %>%
+        str_squish()
+    )
+
+  # 5c. Fuzzy match
+  merged_raw <- stringdist_left_join(
+    roimatch1_clean, LEOK_clean,
+    by = c("clean_academy" = "clean_city"),
+    method = "jw",
+    max_dist = 0.25,
+    distance_col = "dist"
+  ) %>%
+    filter(toupper(state_orig) == statecode)
+
+  # 5d. Pick best match
+  matches_map <- merged_raw %>%
+    group_by(academyname) %>%
+    slice_min(dist, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(academyname, matched_city = city)
+
+  # 5e. Enrich academy data
+  enriched <- roimatch1_clean %>%
+    left_join(matches_map, by = "academyname", suffix = c("", ".fuzzy")) %>%
+    mutate(matched_city = coalesce(matched_city, matched_city.fuzzy)) %>%
+    select(-matched_city.fuzzy) %>%
+    left_join(
+      LEOK_data %>%
+        select(
+          ori, city, statecode, population_served, total_officers,
+          starts_with("total_inj_"),
+          starts_with("total_noninj_"),
+          starts_with("total_killed_"),
+          starts_with("total_asslt_")
+        ),
+      by = c("matched_city" = "city", "state_orig" = "statecode"),
+      relationship = "many-to-many"
+    ) %>%
+    distinct(academyname, .keep_all = TRUE)
+
+  # 5f. Store enriched dataset
+  enriched_list[[as.character(yr)]] <- enriched
+}
+
+# 6. Write to Excel
+write_xlsx(enriched_list, path = "~/Downloads/roimatch1_enriched_2018_2022.xlsx")
+
+
+
+
+//////////////////////////////////////ORI/CLEARANCE MERGE (2018–2022)///////////////////////////////////////
+# enrich_clearance_data.R
+
+# Load libraries
+library(haven)       # for read_dta()
+library(readr)       # for read_csv()
+library(dplyr)
+library(stringr)
+library(fuzzyjoin)
+library(writexl)
+
+# 1. Load and prepare academy ORI list
+academy_data <- read_csv("~/Downloads/roimatch2.csv", show_col_types = FALSE) %>%
+  rename(ORI = ori) %>%
+  mutate(
+    ORI = toupper(str_trim(ORI)),
+    row_id = row_number()
+  )
+
+# 2. Define year range and file paths
+years <- 2018:2022
+file_paths <- paste0("~/Downloads/clearance_", years, ".dta")
+
+# 3. Initialize results list for Excel export
+clearance_matches <- list()
+
+# 4. Loop through each clearance year
+for (i in seq_along(years)) {
+  year <- years[i]
+  file <- file_paths[i]
+
+  # 4a. Load clearance data
+  clearance_raw <- read_dta(file)
+
+  # 4b. Extract labels to identify ACTUAL and CLEARED columns
+  var_labels <- sapply(clearance_raw, function(x) attr(x, "label"), USE.NAMES = TRUE)
+  fields_with_all <- var_labels[grepl("ALL FIELDS", var_labels, ignore.case = TRUE)]
+
+  actual_vars  <- names(fields_with_all)[grepl("ACT # ALL FIELDS", fields_with_all, ignore.case = TRUE)]
+  cleared_vars <- names(fields_with_all)[grepl("TOT CLR ALL FIELDS", fields_with_all, ignore.case = TRUE)]
+
+  # 4c. Summarize actuals, cleared, and clearance rate
+  clearance_summary <- clearance_raw %>%
+    rowwise() %>%
+    mutate(
+      total_actual   = sum(c_across(all_of(actual_vars)), na.rm = TRUE),
+      total_cleared  = sum(c_across(all_of(cleared_vars)), na.rm = TRUE),
+      clearance_rate = if_else(total_actual > 0, total_cleared / total_actual * 100, NA_real_)
+    ) %>%
+    ungroup()
+
+  # 4c-extra. Total violent crimes across months
+  murder_vars    <- c("V70", "V188", "V306", "V424", "V542", "V660", "V778", "V896", "V1014", "V1132", "V1250", "V1358")
+  robbery_vars   <- c("V75", "V193", "V311", "V429", "V547", "V665", "V783", "V901", "V1019", "V1137", "V1255", "V1373")
+  assault_vars   <- c("V80", "V198", "V316", "V434", "V552", "V670", "V788", "V906", "V1024", "V1142", "V1260", "V1378")
+  burglary_vars  <- c("V86", "V204", "V322", "V440", "V558", "V676", "V794", "V912", "V1030", "V1148", "V1266", "V1384")
+
+  clearance_summary <- clearance_summary %>%
+    mutate(
+      total_murder   = rowSums(across(all_of(murder_vars)), na.rm = TRUE),
+      total_robbery  = rowSums(across(all_of(robbery_vars)), na.rm = TRUE),
+      total_assault  = rowSums(across(all_of(assault_vars)), na.rm = TRUE),
+      total_burglary = rowSums(across(all_of(burglary_vars)), na.rm = TRUE)
+    ) %>%
+    select(
+      ORI = V3,
+      total_actual, total_cleared, clearance_rate,
+      total_murder, total_robbery, total_assault, total_burglary
+    ) %>%
+    mutate(ORI = toupper(str_trim(ORI)))
+
+  # 4d. Fuzzy join with academy ORIs
+  matched <- academy_data %>%
+    stringdist_left_join(
+      clearance_summary,
+      by = "ORI",
+      method = "jw",
+      max_dist = 0.1,
+      distance_col = "match_dist"
+    ) %>%
+    arrange(row_id, match_dist) %>%
+    group_by(row_id) %>%
+    slice_min(match_dist, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(-row_id, match_dist) %>%
+    mutate(year = year)
+
+  # 4e. Store result
+  clearance_matches[[as.character(year)]] <- matched
+}
+
+# 5. Export to Excel with each year as a sheet
+write_xlsx(clearance_matches, path = "~/Downloads/roimatch2_clearance_enriched_2018_2022.xlsx")
+
