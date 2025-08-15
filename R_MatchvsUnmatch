@@ -1,0 +1,708 @@
+##########################################################################
+# Academy Post-LEOKA Analysis - R Version (CORRECTED)
+# Original STATA code converted to R
+##########################################################################
+
+# Load required libraries
+library(haven)        # For reading STATA files
+library(dplyr)       # For data manipulation
+library(tidyr)       # For data reshaping
+library(psych)       # For factor analysis
+library(ggplot2)     # For plotting
+library(car)         # For statistical tests
+library(effectsize)  # For standardized mean differences
+library(MASS)        # For multivariate tests
+library(pROC)        # For ROC curves
+library(writexl)     # For Excel export
+
+# IMPORTANT: Resolve namespace conflicts
+# Use dplyr::select explicitly to avoid MASS masking issue
+select <- dplyr::select
+
+# Load data
+df <- read_dta("/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Post-Leoka (Second)/Analysis/STATA/Full_Academy_Post_Merge_JULY31(POST).dta")
+
+cat("Initial data loaded:", nrow(df), "observations\n")
+
+#################################################
+# PART 1: DATA CLEANING
+#################################################
+
+########################################
+# REMOVING UNRELIABLE OBSERVATIONS
+########################################
+
+# Eliminate -8 observations to NA
+# Get all numeric columns
+numeric_cols <- names(df)[sapply(df, is.numeric)]
+df[numeric_cols] <- lapply(df[numeric_cols], function(x) {
+  x[x == -8] <- NA
+  return(x)
+})
+
+# Key Identifiers of Unreliable data
+# First check if columns exist
+required_cols <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands",
+                  "total_noninj_firearms", "total_noninj_knife", "total_noninj_other", "total_noninj_hands",
+                  "total_murder", "total_robbery", "total_assault", "total_burglary", "mean_officers")
+
+missing_cols <- required_cols[!required_cols %in% names(df)]
+if(length(missing_cols) > 0) {
+  cat("Warning: Missing columns:", paste(missing_cols, collapse = ", "), "\n")
+  cat("Creating missing columns with NA values\n")
+  for(col in missing_cols) {
+    df[[col]] <- NA
+  }
+}
+
+# Create total variables - do this in separate steps to avoid errors
+df$total_inj <- rowSums(df[c("total_inj_firearms", "total_inj_knife", 
+                             "total_inj_other", "total_inj_hands")], na.rm = FALSE)
+
+df$total_noninj <- rowSums(df[c("total_noninj_firearms", "total_noninj_knife",
+                                "total_noninj_other", "total_noninj_hands")], na.rm = FALSE)
+
+df$total_incidents <- rowSums(df[c("total_inj", "total_noninj")], na.rm = FALSE)
+
+df$total_violent <- with(df, total_murder + total_robbery + total_assault + total_burglary)
+
+# Replace ori with "." for unreliable observations (LITERAL DOT, not NA)
+if("ori" %in% names(df)) {
+  # Convert ori to character if it isn't already
+  df$ori <- as.character(df$ori)
+  
+  # Replace with literal "." for unreliable observations
+  df$ori <- ifelse(
+    is.na(df$total_incidents) | df$total_incidents == 0 | 
+    is.na(df$total_violent) | df$total_violent == 0 | 
+    is.na(df$mean_officers) | df$mean_officers == 0,
+    ".",  # Literal dot character
+    df$ori
+  )
+  
+  cat("ORI values replaced with '.' for unreliable observations\n")
+  cat("Distribution of ori values:\n")
+  cat("  Non-dot values:", sum(df$ori != ".", na.rm = TRUE), "\n")
+  cat("  Dot values:", sum(df$ori == ".", na.rm = TRUE), "\n")
+} else {
+  df$ori <- "."
+  cat("ORI column not found, creating with all '.'\n")
+}
+
+########################################
+# Necessary Code before Imputation
+########################################
+
+# Relabeling No's as 0 instead of 2
+vars_to_recode <- c("refresher", "pat_yn", "judo_yn", "def_tac_yn", "fire_skill_yn", 
+                   "nonl_yn", "comp_yn", "gang_yn", "comm_yn", "stress_yn", 
+                   "medi_yn", "domv_yn", "victim_yn", "eval_post", "eval_stud", 
+                   "crim_yn", "jjl_yn", "traf_law_yn", "study_yn", "com_part_yn", 
+                   "cult_yn", "prob_solv_yn", "map_yn", "ethic_yn", "prof_yn", 
+                   "cpr_yn", "emv_yn", "evid_yn", "intel_yn", "intero_yn", 
+                   "inv_yn", "rep_yn", "traf_yn", "health_yn", "dui_yn", 
+                   "emr_yn", "htraf_yn", "mental_yn", "opioid_yn")
+
+# Only recode variables that exist
+vars_to_recode <- vars_to_recode[vars_to_recode %in% names(df)]
+df[vars_to_recode] <- lapply(df[vars_to_recode], function(x) {
+  ifelse(x == 2, 0, x)
+})
+
+# Listing class hours as 0 if not taught
+vars <- c("cpr", "comp", "emv", "evid", "intel", "intero", "inv", "pat", "rad", 
+         "rep", "traf", "judo", "def_tac", "fire_skill", "nonl", "crim", "jjl", 
+         "traf_law", "study", "com_part", "cult", "medi", "prob_solv", "map", 
+         "lang", "comm", "ethic", "health", "prof", "stress", "clan", "child", 
+         "cyber", "domv", "dui", "elder", "emr", "gang", "hate", "htraf", 
+         "mental", "opioid", "acsh", "sass", "shar", "terror", "victim")
+
+vars_yn <- paste0(vars, "_yn")
+
+# Set hours to 0 when course not taught
+for (i in seq_along(vars)) {
+  v <- vars[i]
+  vyn <- vars_yn[i]
+  if (v %in% names(df) && vyn %in% names(df)) {
+    df[[v]] <- ifelse(df[[vyn]] == 0, 0, df[[v]])
+  }
+}
+
+#################################################
+# PART 2: VARIABLE CREATION
+#################################################
+
+########################################
+# OUTCOME: LEOKA
+########################################
+
+# Total incidents by weapon type
+df$total_firearms <- rowSums(df[c("total_inj_firearms", "total_noninj_firearms")], na.rm = FALSE)
+df$total_knife <- rowSums(df[c("total_inj_knife", "total_noninj_knife")], na.rm = FALSE)
+df$total_other <- rowSums(df[c("total_inj_other", "total_noninj_other")], na.rm = FALSE)
+df$total_hands <- rowSums(df[c("total_inj_hands", "total_noninj_hands")], na.rm = FALSE)
+
+########################################
+# PREDICTOR: CLETA
+########################################
+
+# Standardizing basic_lgth to hours
+if(all(c("basic_type", "basic_lgth") %in% names(df))) {
+  df <- df %>%
+    mutate(
+      basic_lgth_hours = case_when(
+        basic_type == 1 ~ basic_lgth,                    # Already in hours
+        basic_type == 2 ~ basic_lgth * 40,              # Weeks to hours
+        basic_type == 3 ~ basic_lgth * 173.2,           # Months to hours
+        basic_type == 4 ~ basic_lgth * 519.6,           # Semesters to hours
+        basic_type %in% c(5, -8) ~ NA_real_,            # Other/NA
+        TRUE ~ NA_real_
+      )
+    )
+} else {
+  df$basic_lgth_hours <- NA
+}
+
+# Recode minimum education
+if("min_ed" %in% names(df)) {
+  df <- df %>%
+    mutate(
+      min_ed_cat = case_when(
+        min_ed == 1 ~ 3,                                # Graduate
+        min_ed %in% c(2, 3) ~ 2,                       # College
+        min_ed %in% c(4, 5, 6) ~ 1,                    # High school or less
+        TRUE ~ NA_real_
+      ),
+      min_ed_cat = factor(min_ed_cat, levels = 1:3,
+                         labels = c("High school or less", "College", "Graduate"))
+    )
+} else {
+  df$min_ed_cat <- NA
+}
+
+# Recode Agency type
+if("agencycletatype" %in% names(df)) {
+  df <- df %>%
+    mutate(
+      agency_type3 = case_when(
+        agencycletatype %in% 1:5 ~ 1,                  # Regular
+        agencycletatype %in% 6:7 ~ 2,                  # College
+        TRUE ~ 3                                        # Other
+      ),
+      agency_type3 = factor(agency_type3, levels = 1:3,
+                           labels = c("Regular", "College", "Other"))
+    )
+} else {
+  df$agency_type3 <- NA
+}
+
+# Recode Field Training Prerequisites
+if("field_man" %in% names(df)) {
+  df <- df %>%
+    mutate(
+      field_man = case_when(
+        field_man == 1 ~ 3,
+        field_man == 2 ~ 2,
+        field_man == 3 ~ 1,
+        TRUE ~ field_man
+      )
+    )
+}
+
+# Reverse Original Stress var
+if("environment" %in% names(df)) {
+  df <- df %>%
+    mutate(
+      environment = case_when(
+        environment == 1 ~ 5,
+        environment == 2 ~ 4,
+        environment == 3 ~ 3,
+        environment == 4 ~ 2,
+        environment == 5 ~ 1,
+        TRUE ~ environment
+      )
+    )
+  
+  # Recode Stress Environment to 3 categories
+  df <- df %>%
+    mutate(
+      environment_3 = case_when(
+        environment %in% c(4, 5) ~ 1,
+        environment == 3 ~ 2,
+        environment %in% c(1, 2) ~ 3,
+        TRUE ~ NA_real_
+      )
+    )
+} else {
+  df$environment_3 <- NA
+}
+
+# Create instructor ratio
+if(all(c("ft_total", "pt_total", "sex_start_total") %in% names(df))) {
+  df <- df %>%
+    mutate(instructor_ratio = (ft_total + pt_total) / sex_start_total)
+} else {
+  df$instructor_ratio <- NA
+}
+
+# Create total training hours
+training_subjects <- c("crim", "jjl", "traf_law", "study", "com_part", "cult", 
+                       "medi", "prob_solv", "map", "comm", "ethic", "prof", 
+                       "stress", "cpr", "comp", "emv", "evid", "intel", 
+                       "intero", "inv", "pat", "rep", "traf", "judo", 
+                       "def_tac", "fire_skill", "nonl", "opioid", "mental", 
+                       "htraf", "emr", "dui", "gang")
+
+# Only use subjects that exist in the data
+training_subjects <- training_subjects[training_subjects %in% names(df)]
+if(length(training_subjects) > 0) {
+  df$total_studyhours <- rowSums(df[training_subjects], na.rm = FALSE)
+} else {
+  df$total_studyhours <- NA
+}
+
+# Fail Metrics
+fail_vars <- c("eth_comp_total", "eth_start_total", "fail_total_m", "fail_total_f",
+              "fail_phys_m", "fail_phys_f", "fail_acad_m", "fail_acad_f")
+if(all(fail_vars %in% names(df))) {
+  df <- df %>%
+    mutate(
+      eth_completion_rate = eth_comp_total / eth_start_total,
+      fail_total = fail_total_m + fail_total_f,
+      fail_phys_total = fail_phys_m + fail_phys_f,
+      fail_academic_total = fail_acad_m + fail_acad_f
+    )
+} else {
+  df$fail_total <- NA
+  df$fail_phys_total <- NA
+  df$fail_academic_total <- NA
+  df$eth_completion_rate <- NA
+}
+
+# Firearm Range recode
+if(all(c("in_fire_1", "out_fire_1") %in% names(df))) {
+  df <- df %>%
+    mutate(firerange = as.numeric(in_fire_1 == 1 | out_fire_1 == 1))
+} else {
+  df$firerange <- NA
+}
+
+########################################
+# CONTROL: UCR data
+########################################
+
+ucr_vars <- c("total_cleared_murder", "total_cleared_robbery", 
+             "total_cleared_assault", "total_cleared_burglary")
+
+if(all(ucr_vars %in% names(df)) && "total_violent" %in% names(df)) {
+  df$total_clearviolent <- with(df, total_cleared_murder + total_cleared_robbery + 
+                                    total_cleared_assault + total_cleared_burglary)
+  
+  df$violentclearance_rate <- ifelse(df$total_violent > 0, 
+                                     (df$total_clearviolent / df$total_violent) * 100, 
+                                     NA)
+} else {
+  df$total_clearviolent <- NA
+  df$violentclearance_rate <- NA
+}
+
+# Create match status based on ori
+# ori != "." means matched (has valid ORI)
+# ori == "." means unmatched (no valid ORI)
+df <- df %>%
+  mutate(
+    match_status = ifelse(ori != ".", "matched", "unmatched"),
+    match_status1 = as.numeric(ori != ".")  # 1 for matched, 0 for unmatched
+  )
+
+# Display initial distribution
+cat("\n=== Match Status Distribution ===\n")
+table(df$match_status1)
+cat("\nMatch status summary:\n")
+cat("  Unmatched (ori = '.'):", sum(df$match_status1 == 0, na.rm = TRUE), "\n")
+cat("  Matched (ori != '.'):", sum(df$match_status1 == 1, na.rm = TRUE), "\n")
+cat("  Total N:", nrow(df), "\n")
+cat("  Proportion matched:", round(mean(df$match_status1, na.rm = TRUE), 3), "\n")
+
+################################################################################
+# FACTOR ANALYSIS
+################################################################################
+
+cat("\n=== FACTOR ANALYSIS ===\n")
+
+# Force-based training factor
+force_vars <- c("htraf", "emv", "pat", "judo", "def_tac", "fire_skill", "nonl")
+force_vars <- force_vars[force_vars %in% names(df)]
+if(length(force_vars) > 2) {
+  force_data <- df[complete.cases(df[force_vars]), force_vars]
+  if (nrow(force_data) > 10) {
+    tryCatch({
+      force_fa <- principal(force_data, nfactors = 1, rotate = "varimax")
+      df$force_based <- predict(force_fa, df[force_vars])[,1]
+      cat("Force-based factor variance explained:", round(force_fa$Vaccounted[2,1], 3), "\n")
+    }, error = function(e) {
+      cat("Error in force factor analysis:", e$message, "\n")
+      df$force_based <- NA
+    })
+  } else {
+    df$force_based <- NA
+  }
+} else {
+  df$force_based <- NA
+}
+
+# Contemporary policing factor
+contemp_vars <- c("medi", "prob_solv", "comm", "ethic", "prof")
+contemp_vars <- contemp_vars[contemp_vars %in% names(df)]
+if(length(contemp_vars) > 2) {
+  contemp_data <- df[complete.cases(df[contemp_vars]), contemp_vars]
+  if (nrow(contemp_data) > 10) {
+    tryCatch({
+      contemp_fa <- principal(contemp_data, nfactors = 1, rotate = "varimax")
+      df$contemporary_study <- predict(contemp_fa, df[contemp_vars])[,1]
+      cat("Contemporary study factor variance explained:", round(contemp_fa$Vaccounted[2,1], 3), "\n")
+    }, error = function(e) {
+      cat("Error in contemporary factor analysis:", e$message, "\n")
+      df$contemporary_study <- NA
+    })
+  } else {
+    df$contemporary_study <- NA
+  }
+} else {
+  df$contemporary_study <- NA
+}
+
+# Special topics factor
+special_vars <- c("jjl", "traf_law", "domv", "victim")
+special_vars <- special_vars[special_vars %in% names(df)]
+if(length(special_vars) > 2) {
+  special_data <- df[complete.cases(df[special_vars]), special_vars]
+  if (nrow(special_data) > 10) {
+    tryCatch({
+      special_fa <- principal(special_data, nfactors = 1, rotate = "varimax")
+      df$special_study <- predict(special_fa, df[special_vars])[,1]
+      cat("Special study factor variance explained:", round(special_fa$Vaccounted[2,1], 3), "\n")
+    }, error = function(e) {
+      cat("Error in special factor analysis:", e$message, "\n")
+      df$special_study <- NA
+    })
+  } else {
+    df$special_study <- NA
+  }
+} else {
+  df$special_study <- NA
+}
+
+################################################################################
+# CONTINUOUS VARIABLES - T-TESTS AND WILCOXON TESTS
+################################################################################
+
+continuous_vars <- c("basic_lgth_hours", "ebudget", "opbudget", "fail_phys_total", 
+                    "fail_academic_total", "ft_sworn", "ft_civ", "force_based", 
+                    "contemporary_study", "special_study")
+
+# Filter to only existing variables
+continuous_vars <- continuous_vars[continuous_vars %in% names(df)]
+
+# Create results dataframe
+results_df <- data.frame(
+  variable = character(),
+  n_unmatched = numeric(),
+  n_matched = numeric(),
+  mean_unmatched = numeric(),
+  mean_matched = numeric(),
+  diff = numeric(),
+  t_stat = numeric(),
+  p_value = numeric(),
+  wilcox_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+cat("\n=== CONTINUOUS VARIABLE COMPARISONS ===\n")
+
+for (var in continuous_vars) {
+  # Get data for this variable
+  temp_data <- data.frame(
+    var = df[[var]],
+    match_status1 = df$match_status1
+  )
+  
+  # Remove NA rows
+  temp_data <- temp_data[complete.cases(temp_data), ]
+  
+  if (nrow(temp_data) > 0) {
+    # Summary statistics
+    unmatched <- temp_data$var[temp_data$match_status1 == 0]
+    matched <- temp_data$var[temp_data$match_status1 == 1]
+    
+    n0 <- length(unmatched)
+    n1 <- length(matched)
+    
+    if (n0 > 0 && n1 > 0) {
+      mean0 <- mean(unmatched, na.rm = TRUE)
+      mean1 <- mean(matched, na.rm = TRUE)
+      
+      # T-test
+      tryCatch({
+        t_test <- t.test(var ~ match_status1, data = temp_data)
+        diff <- mean1 - mean0
+        t_stat <- t_test$statistic
+        p_val <- t_test$p.value
+        
+        # Wilcoxon test
+        wilcox_test <- wilcox.test(var ~ match_status1, data = temp_data)
+        wilcox_p <- wilcox_test$p.value
+        
+        # Store results
+        results_df <- rbind(results_df, data.frame(
+          variable = var,
+          n_unmatched = n0,
+          n_matched = n1,
+          mean_unmatched = mean0,
+          mean_matched = mean1,
+          diff = diff,
+          t_stat = t_stat,
+          p_value = p_val,
+          wilcox_p = wilcox_p,
+          stringsAsFactors = FALSE
+        ))
+        
+        # Display
+        cat("\nVariable:", var, "\n")
+        cat("N (unmatched):", n0, ", N (matched):", n1, "\n")
+        cat(sprintf("Mean (unmatched): %.2f, Mean (matched): %.2f\n", mean0, mean1))
+        cat(sprintf("Difference: %.2f, t = %.3f, p = %.4f\n", diff, t_stat, p_val))
+        cat(sprintf("Wilcoxon p-value: %.4f\n", wilcox_p))
+        
+      }, error = function(e) {
+        cat("\nError processing variable", var, ":", e$message, "\n")
+      })
+    } else if (n0 == 0) {
+      cat("\nVariable:", var, "- No unmatched observations\n")
+    } else if (n1 == 0) {
+      cat("\nVariable:", var, "- No matched observations\n")
+    }
+  }
+}
+
+cat("\n=== SUMMARY OF CONTINUOUS VARIABLE COMPARISONS ===\n")
+print(results_df)
+
+################################################################################
+# CATEGORICAL VARIABLES - CHI-SQUARE TESTS
+################################################################################
+
+categorical_vars <- c("field_man", "environment_3", "agency_type3", "min_ed", 
+                     "fitness_1", "obstacle_1", "firerange", "scenario_1", "refresher")
+
+# Filter to only existing variables
+categorical_vars <- categorical_vars[categorical_vars %in% names(df)]
+
+cat("\n=== CHI-SQUARE TESTS FOR CATEGORICAL VARIABLES ===\n")
+
+for (var in categorical_vars) {
+  cat("\nVariable:", var, "\n")
+  
+  tryCatch({
+    # Create contingency table
+    tab <- table(df[[var]], df$match_status1, useNA = "no")
+    
+    if (nrow(tab) > 1 && ncol(tab) > 1 && sum(tab) > 0) {
+      print(tab)
+      
+      # Chi-square test
+      chi_test <- chisq.test(tab)
+      cat("Chi-square statistic:", chi_test$statistic, "\n")
+      cat("p-value:", chi_test$p.value, "\n")
+      
+      # Column percentages
+      prop_tab <- prop.table(tab, 2) * 100
+      cat("\nColumn percentages:\n")
+      print(round(prop_tab, 1))
+    } else if (ncol(tab) == 1) {
+      cat("Only one match status group present\n")
+      print(tab)
+    }
+  }, error = function(e) {
+    cat("Error with", var, ":", e$message, "\n")
+  })
+}
+
+# Create region variable
+if("statecode" %in% names(df)) {
+  df <- df %>%
+    mutate(
+      region = case_when(
+        statecode %in% c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA") ~ 1,
+        statecode %in% c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD") ~ 2,
+        statecode %in% c("DE", "DC", "FL", "GA", "MD", "NC", "SC", "VA", "WV", "AL", "KY", "MS", 
+                        "TN", "AR", "LA", "OK", "TX") ~ 3,
+        statecode %in% c("AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", "CA", "HI", "OR", "WA") ~ 4,
+        TRUE ~ NA_real_
+      ),
+      region = factor(region, levels = 1:4, labels = c("Northeast", "Midwest", "South", "West"))
+    )
+  
+  cat("\nRegion distribution:\n")
+  tryCatch({
+    tab_region <- table(df$region, df$match_status1, useNA = "no")
+    print(tab_region)
+    if(sum(tab_region) > 0 && nrow(tab_region) > 1 && ncol(tab_region) > 1) {
+      chi_region <- chisq.test(tab_region)
+      cat("Chi-square statistic:", chi_region$statistic, "p-value:", chi_region$p.value, "\n")
+    }
+  }, error = function(e) {
+    cat("Error with region analysis:", e$message, "\n")
+  })
+}
+
+################################################################################
+# STANDARDIZED MEAN DIFFERENCES AND BALANCE DIAGNOSTICS
+################################################################################
+
+cat("\n=== STANDARDIZED MEAN DIFFERENCES ===\n")
+
+smd_results <- data.frame(
+  variable = character(),
+  smd = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (var in continuous_vars) {
+  tryCatch({
+    # Get complete data
+    temp_data <- data.frame(
+      var = df[[var]],
+      match_status1 = df$match_status1
+    )
+    temp_data <- temp_data[complete.cases(temp_data), ]
+    
+    if (nrow(temp_data) > 0) {
+      unmatched <- temp_data$var[temp_data$match_status1 == 0]
+      matched <- temp_data$var[temp_data$match_status1 == 1]
+      
+      if (length(unmatched) > 1 && length(matched) > 1) {
+        # Calculate SMD using Cohen's d
+        d <- cohens_d(var ~ match_status1, data = temp_data)
+        
+        smd_results <- rbind(smd_results, data.frame(
+          variable = var,
+          smd = d$Cohens_d,
+          stringsAsFactors = FALSE
+        ))
+        
+        cat(sprintf("%s: SMD = %.3f\n", var, d$Cohens_d))
+      }
+    }
+  }, error = function(e) {
+    cat("Error calculating SMD for", var, ":", e$message, "\n")
+  })
+}
+
+################################################################################
+# MULTIVARIATE HOTELLING'S T-SQUARED TEST
+################################################################################
+
+cat("\n=== MULTIVARIATE TEST FOR FACTOR SCORES ===\n")
+
+# Prepare data for Hotelling's test
+factor_vars <- c("force_based", "contemporary_study", "special_study")
+factor_vars <- factor_vars[factor_vars %in% names(df)]
+
+if(length(factor_vars) > 1) {
+  complete_data <- df[complete.cases(df[c(factor_vars, "match_status1")]), 
+                      c(factor_vars, "match_status1")]
+  
+  if (nrow(complete_data) > 10) {
+    # Check if both groups exist
+    n_groups <- length(unique(complete_data$match_status1))
+    
+    if (n_groups == 2) {
+      # Separate groups
+      group0 <- complete_data[complete_data$match_status1 == 0, factor_vars]
+      group1 <- complete_data[complete_data$match_status1 == 1, factor_vars]
+      
+      if (nrow(group0) > 1 && nrow(group1) > 1) {
+        tryCatch({
+          # Perform Hotelling's T-squared test using MANOVA
+          manova_result <- manova(as.matrix(complete_data[factor_vars]) ~ match_status1, 
+                                 data = complete_data)
+          print(summary(manova_result, test = "Hotelling-Lawley"))
+        }, error = function(e) {
+          cat("Error in MANOVA:", e$message, "\n")
+        })
+      }
+    } else {
+      cat("Only one group present in data - cannot perform multivariate test\n")
+    }
+  }
+}
+################################################################################
+# EXPORT RESULTS
+################################################################################
+
+cat("\n=== EXPORTING RESULTS ===\n")
+
+# Summary statistics by group
+tryCatch({
+  # Check if both groups exist
+  if(sum(df$match_status1 == 1, na.rm = TRUE) > 0) {
+    matched_stats <- df %>%
+      filter(match_status1 == 1) %>%
+      dplyr::select(all_of(continuous_vars[continuous_vars %in% names(df)])) %>%
+      summarise_all(list(
+        n = ~sum(!is.na(.)),
+        mean = ~mean(., na.rm = TRUE),
+        sd = ~sd(., na.rm = TRUE),
+        min = ~min(., na.rm = TRUE),
+        max = ~max(., na.rm = TRUE)
+      ))
+  } else {
+    matched_stats <- data.frame(note = "No matched observations")
+  }
+  
+  if(sum(df$match_status1 == 0, na.rm = TRUE) > 0) {
+    unmatched_stats <- df %>%
+      filter(match_status1 == 0) %>%
+      dplyr::select(all_of(continuous_vars[continuous_vars %in% names(df)])) %>%
+      summarise_all(list(
+        n = ~sum(!is.na(.)),
+        mean = ~mean(., na.rm = TRUE),
+        sd = ~sd(., na.rm = TRUE),
+        min = ~min(., na.rm = TRUE),
+        max = ~max(., na.rm = TRUE)
+      ))
+  } else {
+    unmatched_stats <- data.frame(note = "No unmatched observations")
+  }
+  
+  # Export to Excel
+  write_xlsx(list(
+    "Matched_Stats" = matched_stats,
+    "Unmatched_Stats" = unmatched_stats,
+    "T_Test_Results" = results_df,
+    "SMD_Results" = smd_results
+  ), "matched_unmatched_results.xlsx")
+  
+  cat("Results exported to matched_unmatched_results.xlsx\n")
+}, error = function(e) {
+  cat("Error exporting results:", e$message, "\n")
+})
+
+################################################################################
+# SAVE MODIFIED DATASET
+################################################################################
+
+# Save as RDS (R's native format)
+saveRDS(df, "matchvsunmatched_with_factors.rds")
+
+# Or save as STATA file if needed
+tryCatch({
+  write_dta(df, "matchvsunmatched_with_factors.dta")
+}, error = function(e) {
+  cat("Note: Could not save as STATA file:", e$message, "\n")
+})
+
+cat("\nAnalysis complete!\n")
+cat(paste("Dataset saved with", nrow(df), "observations and", ncol(df), "variables\n"))
+
