@@ -1,0 +1,535 @@
+##########################################################################
+# PART 1: Data Loading and Cleaning
+##########################################################################
+
+# Load required libraries
+library(haven)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(car)
+
+# Load the data
+data <- read_dta("summarystat.dta")
+
+# Display initial data info
+cat("Initial dataset dimensions:", nrow(data), "rows and", ncol(data), "columns\n\n")
+
+###################################### REMOVING UNRELIABLE OBSERVATIONS ######################################
+
+# Drop observations where ori == "."
+initial_rows <- nrow(data)
+if("ori" %in% names(data)) {
+  data <- data[data$ori != ".", ]
+  cat("Removed", initial_rows - nrow(data), "observations with ori == '.'\n")
+}
+
+# Replace -8 with NA in all numeric variables
+numeric_vars <- sapply(data, is.numeric)
+data[numeric_vars] <- lapply(data[numeric_vars], function(x) ifelse(x == -8, NA, x))
+cat("Replaced -8 with NA in numeric variables\n")
+
+# Key Identifiers of Unreliable data
+# Create total injury and incident variables if component variables exist
+if(all(c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands") %in% names(data))) {
+  data$total_inj <- rowSums(data[c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands")], na.rm = FALSE)
+}
+
+if(all(c("total_noninj_firearms", "total_noninj_knife", "total_noninj_other", "total_noninj_hands") %in% names(data))) {
+  data$total_noninj <- rowSums(data[c("total_noninj_firearms", "total_noninj_knife", "total_noninj_other", "total_noninj_hands")], na.rm = FALSE)
+}
+
+if(all(c("total_inj", "total_noninj") %in% names(data))) {
+  data$total_incidents <- rowSums(data[c("total_inj", "total_noninj")], na.rm = FALSE)
+}
+
+if(all(c("total_murder", "total_robbery", "total_assault", "total_burglary") %in% names(data))) {
+  data$total_violent <- data$total_murder + data$total_robbery + data$total_assault + data$total_burglary
+}
+
+# Drop observations where key variables equal 0
+before_drop <- nrow(data)
+drop_vars <- c("total_incidents", "total_violent", "mean_officers")
+existing_drop_vars <- drop_vars[drop_vars %in% names(data)]
+
+if(length(existing_drop_vars) > 0) {
+  for(var in existing_drop_vars) {
+    data <- data[!(data[[var]] == 0 | is.na(data[[var]])), ]
+  }
+  cat("Removed", before_drop - nrow(data), "observations with zero values in key variables\n")
+}
+
+###################################### Necessary Code before Imputation ######################################
+
+# Relabeling No's as 0 instead of 2
+binary_vars <- c("refresher", "pat_yn", "judo_yn", "def_tac_yn", "fire_skill_yn", "nonl_yn", 
+                 "comp_yn", "gang_yn", "comm_yn", "stress_yn", "medi_yn", "domv_yn", "victim_yn", 
+                 "eval_post", "eval_stud", "crim_yn", "jjl_yn", "traf_law_yn", "study_yn", 
+                 "com_part_yn", "cult_yn", "prob_solv_yn", "map_yn", "ethic_yn", "prof_yn", 
+                 "cpr_yn", "emv_yn", "evid_yn", "intel_yn", "intero_yn", "inv_yn", "rep_yn", 
+                 "traf_yn", "health_yn", "dui_yn", "emr_yn", "htraf_yn", "mental_yn", "opioid_yn")
+
+for(var in binary_vars) {
+  if(var %in% names(data)) {
+    data[[var]][data[[var]] == 2] <- 0
+  }
+}
+cat("Recoded binary variables (2 -> 0)\n")
+
+# Listing class hours as 0 if not taught
+vars <- c("cpr", "comp", "emv", "evid", "intel", "intero", "inv", "pat", "rad", "rep", "traf", 
+          "judo", "def_tac", "fire_skill", "nonl", "crim", "jjl", "traf_law", "study", 
+          "com_part", "cult", "medi", "prob_solv", "map", "lang", "comm", "ethic", "health", 
+          "prof", "stress", "clan", "child", "cyber", "domv", "dui", "elder", "emr", "gang", 
+          "hate", "htraf", "mental", "opioid", "acsh", "sass", "shar", "terror", "victim")
+
+vars_yn <- paste0(vars, "_yn")
+
+for(i in seq_along(vars)) {
+  if(vars[i] %in% names(data) && vars_yn[i] %in% names(data)) {
+    data[[vars[i]]][data[[vars_yn[i]]] == 0] <- 0
+  }
+}
+cat("Set class hours to 0 where courses not taught\n")
+
+# Standardizing basic_lgth to hours
+if(all(c("basic_lgth", "basic_type") %in% names(data))) {
+  data$basic_lgth_hours <- NA
+  
+  # Keep original if already in hours
+  mask1 <- !is.na(data$basic_type) & data$basic_type == 1
+  data$basic_lgth_hours[mask1] <- data$basic_lgth[mask1]
+  
+  # Convert weeks to hours (5 business days × 8 hours/day = 40 hours/week)
+  mask2 <- !is.na(data$basic_type) & data$basic_type == 2
+  data$basic_lgth_hours[mask2] <- data$basic_lgth[mask2] * 40
+  
+  # Convert months to hours (4.33 weeks/month × 5 business days/week × 8 hours/day = 173.2 hours/month)
+  mask3 <- !is.na(data$basic_type) & data$basic_type == 3
+  data$basic_lgth_hours[mask3] <- data$basic_lgth[mask3] * 173.2
+  
+  # Convert semesters to hours (3 months × 173.2 hours/month = 519.6 hours/semester)
+  mask4 <- !is.na(data$basic_type) & data$basic_type == 4
+  data$basic_lgth_hours[mask4] <- data$basic_lgth[mask4] * 519.6
+  
+  # Handle 'Other increment' and N/A: keep as missing
+  mask5 <- !is.na(data$basic_type) & data$basic_type %in% c(5, -8)
+  data$basic_lgth_hours[mask5] <- NA
+  
+  cat("Standardized basic training length to hours\n")
+}
+
+# Two-level education indicator: 0 = High school or less; 1 = College or higher
+if("min_ed" %in% names(data)) {
+  data$min_ed_bin <- ifelse(data$min_ed %in% c(1,2,3), 1,
+                           ifelse(data$min_ed %in% c(4,5,6), 0, NA))
+  cat("Created binary education indicator\n")
+}
+
+# Recode Agency type var
+if("agencycletatype" %in% names(data)) {
+  data$agency_type3 <- ifelse(data$agencycletatype %in% c(1,2,3,4,5), 1,
+                             ifelse(data$agencycletatype %in% c(6,7), 2, 3))
+  cat("Recoded agency type\n")
+}
+
+# Recoding Field Training Prerequisites
+if("field_man" %in% names(data)) {
+  data$field_man <- car::recode(data$field_man, "1=3; 2=2; 3=1")
+  cat("Recoded field training requirements\n")
+}
+
+# Reverse Original Stress var/ recode ordinal var
+if("environment" %in% names(data)) {
+  data$environment <- car::recode(data$environment, "1=5; 2=4; 3=3; 4=2; 5=1")
+  
+  # Recoding Stress Environment to 3 categories
+  data$environment_3 <- NA
+  data$environment_3[data$environment %in% c(4, 5)] <- 1
+  data$environment_3[data$environment == 3] <- 2
+  data$environment_3[data$environment %in% c(1, 2)] <- 3
+  cat("Recoded stress environment variables\n")
+}
+
+cat("\nFinal dataset dimensions after cleaning:", nrow(data), "rows and", ncol(data), "columns\n\n")
+
+##########################################################################
+# PART 2: Generate Summary Statistics
+##########################################################################
+
+# Function to calculate summary statistics
+get_summary_stats <- function(data, var_name) {
+  if (is.numeric(data[[var_name]])) {
+    # Check if variable appears to be categorical (has few unique values)
+    unique_vals <- unique(na.omit(data[[var_name]]))
+    n_unique <- length(unique_vals)
+    
+    # Treat as categorical if it has 5 or fewer unique values or is a binary/ordinal variable
+    categorical_vars <- c("field_man", "environment_3", "agency_type3", "min_ed_bin", 
+                         "firerange", "fitness_fac", "obstacle", "scenario", "refresher",
+                         "region")
+    
+    if (var_name %in% categorical_vars || (n_unique <= 5 && all(unique_vals %in% 0:10))) {
+      # Treat as categorical
+      freq_table <- table(data[[var_name]], useNA = "no")
+      prop_table <- prop.table(freq_table) * 100
+      n_obs <- sum(freq_table)
+      
+      # Create formatted output
+      cat_summary <- data.frame(
+        Variable = var_name,
+        Value = "",
+        N = as.character(n_obs)
+      )
+      
+      # Add each category as a separate row
+      for (i in seq_along(freq_table)) {
+        cat_row <- data.frame(
+          Variable = "",
+          Value = paste0(names(freq_table)[i], ": ", freq_table[i], " (", round(prop_table[i], 0), "%)"),
+          N = ""
+        )
+        cat_summary <- rbind(cat_summary, cat_row)
+      }
+      
+      return(cat_summary)
+    } else {
+      # For continuous numeric variables
+      n_obs <- sum(!is.na(data[[var_name]]))
+      if (n_obs > 0) {
+        mean_val <- mean(data[[var_name]], na.rm = TRUE)
+        sd_val <- sd(data[[var_name]], na.rm = TRUE)
+        min_val <- min(data[[var_name]], na.rm = TRUE)
+        max_val <- max(data[[var_name]], na.rm = TRUE)
+        
+        # Format as "mean (sd), min-max"
+        value_str <- sprintf("%.2f (%.2f), %g-%g", mean_val, sd_val, min_val, max_val)
+        
+        return(data.frame(
+          Variable = var_name,
+          Value = value_str,
+          N = as.character(n_obs)
+        ))
+      }
+    }
+  } else {
+    # For non-numeric categorical variables
+    freq_table <- table(data[[var_name]], useNA = "no")
+    prop_table <- prop.table(freq_table) * 100
+    n_obs <- sum(freq_table)
+    
+    cat_summary <- data.frame(
+      Variable = var_name,
+      Value = "",
+      N = as.character(n_obs)
+    )
+    
+    for (i in seq_along(freq_table)) {
+      cat_row <- data.frame(
+        Variable = "",
+        Value = paste0(names(freq_table)[i], ": ", freq_table[i], " (", round(prop_table[i], 0), "%)"),
+        N = ""
+      )
+      cat_summary <- rbind(cat_summary, cat_row)
+    }
+    
+    return(cat_summary)
+  }
+}
+
+# Generate summary by categories
+cat("\n=== SUMMARY STATISTICS (After Cleaning) ===\n\n")
+
+# Define variable groups based on your original table
+outcome_vars <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", 
+                  "total_injuries", "total_firearms", "total_knife", "total_other", 
+                  "total_hands", "total_incidents")
+
+structure_vars <- c("basic_lgth_hours", "field_man", "environment_3", "ebudget", "opbudget",
+                   "agency_type3", "fail_phys_total", "fail_academic_total", "min_ed_bin", 
+                   "fitness_1", "obstacle_1", "firerange", "scenario_1")
+
+curriculum_vars <- c("emv", "pat", "judo", "def_tac", "fire_skill", "nonl", "medi", "prob_solv",
+                    "comm", "ethic", "prof", "stress", "crim", "htraf", "jjl", "traf_law",
+                    "domv", "gang", "victim", "com_part", "ft_sworn", "ft_civ",
+                    "refresher")
+
+control_vars <- c("mean_officers", "total_violent", "violentclearance_rate", "statecode")
+
+# Add custom labels for better interpretation
+add_labels <- function(df, var_name) {
+  # Define labels for specific variables
+  labels <- list(
+    field_man = c("1" = "Not Required", "2" = "Required for Some", "3" = "Required for All"),
+    environment_3 = c("1" = "Low", "2" = "Medium", "3" = "High"),
+    agency_type3 = c("1" = "State/Local Police", "2" = "College/University", "3" = "Other"),
+    min_ed_bin = c("0" = "High School or Less", "1" = "College or Higher"),
+    firerange = c("0" = "No", "1" = "Yes"),
+    fitness_fac = c("0" = "No", "1" = "Yes"),
+    obstacle = c("0" = "No", "1" = "Yes"),
+    scenario = c("0" = "No", "1" = "Yes"),
+    refresher = c("0" = "No", "1" = "Yes"),
+    region = c("1" = "Northeast", "2" = "Midwest", "3" = "South", "4" = "West")
+  )
+  
+  # Apply labels if available
+  if (var_name %in% names(labels) && nrow(df) > 1) {
+    label_map <- labels[[var_name]]
+    for (i in 2:nrow(df)) {
+      # Extract the value from the string
+      val <- sub(":.*", "", df$Value[i])
+      if (val %in% names(label_map)) {
+        # Replace with labeled value
+        df$Value[i] <- sub(paste0("^", val, ":"), paste0(label_map[val], ":"), df$Value[i])
+      }
+    }
+  }
+  
+  return(df)
+}
+
+# Update the get_summary_stats function to use labels
+get_summary_stats <- function(data, var_name) {
+  if (is.numeric(data[[var_name]])) {
+    # Check if variable appears to be categorical (has few unique values)
+    unique_vals <- unique(na.omit(data[[var_name]]))
+    n_unique <- length(unique_vals)
+    
+    # Treat as categorical if it has 5 or fewer unique values or is a binary/ordinal variable
+    categorical_vars <- c("field_man", "environment_3", "agency_type3", "min_ed_bin", 
+                         "firerange", "fitness_fac", "obstacle", "scenario", "refresher",
+                         "region")
+    
+    if (var_name %in% categorical_vars || (n_unique <= 5 && all(unique_vals %in% 0:10))) {
+      # Treat as categorical
+      freq_table <- table(data[[var_name]], useNA = "no")
+      prop_table <- prop.table(freq_table) * 100
+      n_obs <- sum(freq_table)
+      
+      # Create formatted output
+      cat_summary <- data.frame(
+        Variable = var_name,
+        Value = "",
+        N = as.character(n_obs)
+      )
+      
+      # Add each category as a separate row
+      for (i in seq_along(freq_table)) {
+        cat_row <- data.frame(
+          Variable = "",
+          Value = paste0(names(freq_table)[i], ": ", freq_table[i], " (", round(prop_table[i], 0), "%)"),
+          N = ""
+        )
+        cat_summary <- rbind(cat_summary, cat_row)
+      }
+      
+      # Add labels
+      cat_summary <- add_labels(cat_summary, var_name)
+      
+      return(cat_summary)
+    } else {
+      # For continuous numeric variables
+      n_obs <- sum(!is.na(data[[var_name]]))
+      if (n_obs > 0) {
+        mean_val <- mean(data[[var_name]], na.rm = TRUE)
+        sd_val <- sd(data[[var_name]], na.rm = TRUE)
+        min_val <- min(data[[var_name]], na.rm = TRUE)
+        max_val <- max(data[[var_name]], na.rm = TRUE)
+        
+        # Format as "mean (sd), min-max"
+        value_str <- sprintf("%.2f (%.2f), %g-%g", mean_val, sd_val, min_val, max_val)
+        
+        return(data.frame(
+          Variable = var_name,
+          Value = value_str,
+          N = as.character(n_obs)
+        ))
+      }
+    }
+  } else {
+    # For non-numeric categorical variables
+    freq_table <- table(data[[var_name]], useNA = "no")
+    prop_table <- prop.table(freq_table) * 100
+    n_obs <- sum(freq_table)
+    
+    cat_summary <- data.frame(
+      Variable = var_name,
+      Value = "",
+      N = as.character(n_obs)
+    )
+    
+    for (i in seq_along(freq_table)) {
+      cat_row <- data.frame(
+        Variable = "",
+        Value = paste0(names(freq_table)[i], ": ", freq_table[i], " (", round(prop_table[i], 0), "%)"),
+        N = ""
+      )
+      cat_summary <- rbind(cat_summary, cat_row)
+    }
+    
+    # Add labels
+    cat_summary <- add_labels(cat_summary, var_name)
+    
+    return(cat_summary)
+  }
+}
+
+summary_results <- list()
+
+for (category in names(categories)) {
+  cat("\n**", category, "**\n")
+  vars_in_cat <- categories[[category]][categories[[category]] %in% names(data)]
+  
+  if (length(vars_in_cat) > 0) {
+    cat_summary <- bind_rows(lapply(vars_in_cat, function(x) get_summary_stats(data, x)))
+    print(kable(cat_summary, format = "simple", col.names = c("Variable", "Value", "N")))
+    summary_results[[category]] <- cat_summary
+  }
+}
+
+# Save cleaned data and summary
+write.csv(data, "cleaned_summarystat.csv", row.names = FALSE)
+cat("\n\nCleaned data saved to 'cleaned_summarystat.csv'\n")
+
+# Create a detailed summary for numeric variables only
+numeric_summary <- data %>%
+  select(where(is.numeric)) %>%
+  summarise_all(list(
+    mean = ~round(mean(., na.rm = TRUE), 2),
+    sd = ~round(sd(., na.rm = TRUE), 2),
+    min = ~min(., na.rm = TRUE),
+    max = ~max(., na.rm = TRUE),
+    n = ~sum(!is.na(.))
+  )) %>%
+  pivot_longer(everything(), names_to = c("variable", ".value"), names_sep = "_(?=mean|sd|min|max|n)")
+
+write.csv(numeric_summary, "numeric_detailed_summary.csv", row.names = FALSE)
+cat("Detailed numeric summary saved to 'numeric_detailed_summary.csv'\n")
+
+##########################################################################
+# PART 3: Create Formatted Summary Table
+##########################################################################
+
+cat("\n\n=== FORMATTED SUMMARY TABLE ===\n\n")
+cat("**Section**\n**Variable**\n**Value**\n")
+
+# Function to format summary for final table
+format_for_table <- function(data, var_name, var_label = NULL) {
+  label <- ifelse(is.null(var_label), var_name, var_label)
+  
+  if (!(var_name %in% names(data))) {
+    return(NULL)
+  }
+  
+  if (is.numeric(data[[var_name]])) {
+    unique_vals <- unique(na.omit(data[[var_name]]))
+    n_unique <- length(unique_vals)
+    
+    # Categorical variables
+    categorical_vars <- c("field_man", "environment_3", "agency_type3", "min_ed_bin", 
+                         "fitness_1", "obstacle_1", "firerange", "scenario_1", "refresher",
+                         "statecode")
+    
+    if (var_name %in% categorical_vars || (n_unique <= 5 && all(unique_vals %in% 0:10))) {
+      freq_table <- table(data[[var_name]], useNA = "no")
+      prop_table <- prop.table(freq_table) * 100
+      
+      # Get labels
+      labels <- list(
+        field_man = c("1" = "Not Required", "2" = "Required For Some", "3" = "Required For All"),
+        environment_3 = c("1" = "Low", "2" = "Medium", "3" = "High"),
+        agency_type3 = c("1" = "State/Local Police", "2" = "College/University", "3" = "Other"),
+        min_ed_bin = c("0" = "No", "1" = "Yes"),
+        fitness_1 = c("0" = "No", "1" = "Yes"),
+        obstacle_1 = c("0" = "No", "1" = "Yes"),
+        firerange = c("0" = "No", "1" = "Yes"),
+        scenario_1 = c("0" = "No", "1" = "Yes"),
+        refresher = c("0" = "No", "1" = "Yes")
+      )
+      
+      cat(label, ":\n", sep="")
+      for (i in seq_along(freq_table)) {
+        val <- names(freq_table)[i]
+        if (var_name %in% names(labels) && val %in% names(labels[[var_name]])) {
+          cat_label <- labels[[var_name]][val]
+        } else {
+          cat_label <- val
+        }
+        cat(cat_label, "\n", freq_table[i], " (", round(prop_table[i], 0), "%)\n", sep="")
+      }
+    } else {
+      # Continuous variables
+      mean_val <- mean(data[[var_name]], na.rm = TRUE)
+      sd_val <- sd(data[[var_name]], na.rm = TRUE)
+      min_val <- min(data[[var_name]], na.rm = TRUE)
+      max_val <- max(data[[var_name]], na.rm = TRUE)
+      
+      cat("  ", label, "\n", sprintf("%.2f (%.2f), %g-%g", mean_val, sd_val, min_val, max_val), "\n", sep="")
+    }
+  }
+}
+
+# Outcome Variables
+cat("**Outcome Variables:**\n \n \n")
+cat("Officer Injuries\n")
+format_for_table(data, "total_inj_firearms", "  Firearms Injuries")
+format_for_table(data, "total_inj_knife", "  Knife Injuries")
+format_for_table(data, "total_inj_other", "  Other Weapon Injuries")
+format_for_table(data, "total_inj_hands", "  Hands/Feet Injuries")
+format_for_table(data, "total_injuries", "  Total Injuries")
+
+cat("Officer Incidents\n")
+format_for_table(data, "total_firearms", "  Firearms Incidents")
+format_for_table(data, "total_knife", "  Knife Incidents")
+format_for_table(data, "total_other", "  Other Weapon Incidents")
+format_for_table(data, "total_hands", "  Hands/Feet Incidents")
+format_for_table(data, "total_incidents", "  Total Incidents")
+
+# Academy Structure
+cat("**Academy Structure**\n")
+format_for_table(data, "basic_lgth_hours", "  Basic Training Length")
+format_for_table(data, "field_man", "Field Training Requirements")
+format_for_table(data, "environment_3", "Self-Reported Stress Environment")
+format_for_table(data, "ebudget", "  Equipment Budget")
+format_for_table(data, "opbudget", "  Operational Budget")
+format_for_table(data, "agency_type3", "Overseeing Agency")
+format_for_table(data, "fail_phys_total", "  Total Failed: Physical")
+format_for_table(data, "fail_academic_total", "  Total Failed: Academic")
+format_for_table(data, "min_ed_bin", "Minimum Education")
+format_for_table(data, "fitness_1", "Fitness Facilities")
+format_for_table(data, "obstacle_1", "Obstacle Courses")
+format_for_table(data, "firerange", "Firing Range")
+format_for_table(data, "scenario_1", "Scenario Training")
+
+# Academy Curriculum
+cat("**Academy Curriculum**\n")
+format_for_table(data, "emv", "  Emergency Vehicle Operations")
+format_for_table(data, "pat", "  Patrol Procedures")
+format_for_table(data, "judo", "  Self-Defense/Judo")
+format_for_table(data, "def_tac", "  Defensive Tactics")
+format_for_table(data, "fire_skill", "  Firearms Skills")
+format_for_table(data, "nonl", "  Nonlethal Weapons")
+format_for_table(data, "medi", "  Mediation")
+format_for_table(data, "prob_solv", "  Problem Solving")
+format_for_table(data, "comm", "  Communication Skills")
+format_for_table(data, "ethic", "  Ethics And Integrity")
+format_for_table(data, "prof", "  Professionalism")
+format_for_table(data, "stress", "  Stress Management")
+format_for_table(data, "crim", "  Criminal Law")
+format_for_table(data, "htraf", "  Human Trafficking")
+format_for_table(data, "jjl", "  Juvenile Justice Law")
+format_for_table(data, "traf_law", "  Traffic Law")
+format_for_table(data, "domv", "  Domestic Violence")
+format_for_table(data, "gang", "  Gangs")
+format_for_table(data, "victim", "  Victims' Rights")
+format_for_table(data, "com_part", "  Community Partnerships")
+format_for_table(data, "ft_sworn", "  Full-Time Sworn Instructors")
+format_for_table(data, "ft_civ", "  Full-Time Civilian Instructors")
+format_for_table(data, "refresher", "Instructor Refresher Courses")
+
+# Controls
+cat("**Controls**\n")
+format_for_table(data, "mean_officers", "  Average Officers")
+format_for_table(data, "total_violent", "  Total Violence Crime")
+format_for_table(data, "violentclearance_rate", "  Violence Crime Clearance Rate")
+format_for_table(data, "statecode", "Regions")
