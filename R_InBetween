@@ -1,0 +1,427 @@
+# 📦 Load required libraries
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(ggsignif)
+library(patchwork)
+library(dunn.test)
+library(psych)
+
+# 📥 Load dataset
+data <- read_dta("~/Downloads/***_In-between.dta")
+
+# Function to perform factor analysis
+perform_factor_analysis <- function(data, vars, factor_name) {
+  vars_exist <- vars[vars %in% names(data)]
+  
+  if(length(vars_exist) < 2) {
+    warning(paste("Not enough variables for factor analysis of", factor_name))
+    return(data)
+  }
+  
+  factor_data <- data[, vars_exist]
+  fa_result <- fa(factor_data, nfactors = 1, rotate = "varimax", scores = "regression")
+  data[[factor_name]] <- as.vector(fa_result$scores)
+  
+  return(data)
+}
+
+# Create factor variables FIRST (before outlier removal)
+cat("\n📊 Creating factor variables...\n")
+force_vars <- c("htraf", "emv", "pat", "judo", "def_tac", "fire_skill", "nonl")
+force_vars <- force_vars[force_vars %in% names(data)]
+if(length(force_vars) > 0) {
+  data <- perform_factor_analysis(data, force_vars, "force_based")
+  cat("✅ Created force_based factor\n")
+}
+
+contemporary_vars <- c("medi", "prob_solv", "comm", "ethic", "prof")
+contemporary_vars <- contemporary_vars[contemporary_vars %in% names(data)]
+if(length(contemporary_vars) > 0) {
+  data <- perform_factor_analysis(data, contemporary_vars, "contemporary_study")
+  cat("✅ Created contemporary_study factor\n")
+}
+
+special_vars <- c("jjl", "traf_law", "domv", "victim")
+special_vars <- special_vars[special_vars %in% names(data)]
+if(length(special_vars) > 0) {
+  data <- perform_factor_analysis(data, special_vars, "special_study")
+  cat("✅ Created special_study factor\n")
+}
+
+# 🏷️ Label agency_type3
+data$agency_type3 <- factor(data$agency_type3,
+                            levels = c(1, 2, 3),
+                            labels = c("Regular", "College", "Other"))
+
+# 🎨 Color palette
+fill_colors <- c("Regular" = "#9ECAE1",
+                 "College" = "#BCBDDC",
+                 "Other" = "#D9D9D9")
+
+# 📊 Pairwise comparisons
+comparisons <- list(
+  c("Regular", "College"),
+  c("Regular", "Other"),
+  c("College", "Other")
+)
+
+# 🧼 IQR-based outlier removal function with reporting
+remove_outliers <- function(df, variable, group_var, iqr_multiplier = 1.25) {
+  var_name <- deparse(substitute(variable))
+  
+  # Get original counts
+  original_counts <- df %>%
+    group_by({{ group_var }}) %>%
+    summarise(n_original = n())
+  
+  # Remove outliers using IQR method with custom multiplier
+  cleaned_df <- df %>%
+    group_by({{ group_var }}) %>%
+    filter(
+      !is.na({{ variable }}),
+      {{ variable }} > quantile({{ variable }}, 0.25, na.rm = TRUE) - iqr_multiplier * IQR({{ variable }}, na.rm = TRUE),
+      {{ variable }} < quantile({{ variable }}, 0.75, na.rm = TRUE) + iqr_multiplier * IQR({{ variable }}, na.rm = TRUE)
+    ) %>%
+    ungroup()
+  
+  # Get cleaned counts
+  cleaned_counts <- cleaned_df %>%
+    group_by({{ group_var }}) %>%
+    summarise(n_cleaned = n())
+  
+  # Report outlier removal
+  outlier_report <- left_join(original_counts, cleaned_counts, by = names(original_counts)[1]) %>%
+    mutate(
+      n_removed = n_original - n_cleaned,
+      pct_removed = round(100 * n_removed / n_original, 1)
+    )
+  
+  cat("\n📊 Outlier removal for", var_name, "using", iqr_multiplier, "× IQR method:\n")
+  print(outlier_report)
+  cat("Total outliers removed:", sum(outlier_report$n_removed), 
+      "(", round(100 * sum(outlier_report$n_removed) / sum(outlier_report$n_original), 1), "%)\n")
+  
+  return(cleaned_df)
+}
+
+# 🧼 NOW remove outliers AFTER factor analysis with stricter criterion
+cat("\n\n🔍 APPLYING IQR-BASED OUTLIER REMOVAL (1.25×IQR METHOD)\n")
+cat(paste(rep("=", 60), collapse = ""), "\n")
+
+clean_force     <- remove_outliers(data, force_based, agency_type3, iqr_multiplier = 1.25)
+clean_special   <- remove_outliers(data, special_study, agency_type3, iqr_multiplier = 1.25)
+clean_contemporary    <- remove_outliers(data, contemporary_study, agency_type3, iqr_multiplier = 1.25)
+clean_inj       <- remove_outliers(data, total_inj, agency_type3, iqr_multiplier = 1.25)
+clean_incidents <- remove_outliers(data, total_incidents, agency_type3, iqr_multiplier = 1.25)
+
+cat("\n✅ Outlier removal complete using 1.25×IQR method\n")
+cat(paste(rep("=", 60), collapse = ""), "\n")
+
+# 🧪 Run Kruskal-Wallis and Dunn tests on CLEANED data
+run_kw_and_dunn <- function(df, yvar, label) {
+  cat("\n\n==============================\n")
+  cat("▶", label, "\n")
+  cat("==============================\n\n")
+  
+  # Kruskal-Wallis test
+  kw_result <- kruskal.test(df[[yvar]] ~ df$agency_type3)
+  print(kw_result)
+  
+  # Dunn test
+  cat("\n🔍 Dunn Test (Bonferroni-adjusted):\n")
+  dunn_result <- dunn.test(df[[yvar]], df$agency_type3, method = "bonferroni", table = TRUE, list = TRUE)
+  
+  # Extract p-values and create annotations in the correct order
+  # The dunn.test function returns comparisons in a specific order
+  # We need to match them to our ggsignif comparisons order
+  
+  # Get the comparison names from dunn.test
+  comparisons_made <- dunn_result$comparisons
+  p_vals_adjusted <- dunn_result$P.adjusted
+  
+  # Create a lookup for p-values
+  p_lookup <- setNames(p_vals_adjusted, comparisons_made)
+  
+  # Print available comparisons for debugging
+  cat("\nAvailable comparisons from Dunn test:\n")
+  print(comparisons_made)
+  
+  # Map to our ggsignif order
+  # Try both possible orderings since Dunn test may use either format
+  annotations <- c(
+    # Regular vs College
+    ifelse(!is.na(p_lookup["Regular - College"]), 
+           ifelse(p_lookup["Regular - College"] < 0.001, "***",
+                  ifelse(p_lookup["Regular - College"] < 0.01, "**",
+                         ifelse(p_lookup["Regular - College"] < 0.05, "*", "ns"))),
+           ifelse(p_lookup["College - Regular"] < 0.001, "***",
+                  ifelse(p_lookup["College - Regular"] < 0.01, "**",
+                         ifelse(p_lookup["College - Regular"] < 0.05, "*", "ns")))),
+    # Regular vs Other
+    ifelse(!is.na(p_lookup["Regular - Other"]), 
+           ifelse(p_lookup["Regular - Other"] < 0.001, "***",
+                  ifelse(p_lookup["Regular - Other"] < 0.01, "**",
+                         ifelse(p_lookup["Regular - Other"] < 0.05, "*", "ns"))),
+           ifelse(p_lookup["Other - Regular"] < 0.001, "***",
+                  ifelse(p_lookup["Other - Regular"] < 0.01, "**",
+                         ifelse(p_lookup["Other - Regular"] < 0.05, "*", "ns")))),
+    # College vs Other
+    ifelse(!is.na(p_lookup["College - Other"]), 
+           ifelse(p_lookup["College - Other"] < 0.001, "***",
+                  ifelse(p_lookup["College - Other"] < 0.01, "**",
+                         ifelse(p_lookup["College - Other"] < 0.05, "*", "ns"))),
+           ifelse(p_lookup["Other - College"] < 0.001, "***",
+                  ifelse(p_lookup["Other - College"] < 0.01, "**",
+                         ifelse(p_lookup["Other - College"] < 0.05, "*", "ns"))))
+  )
+  
+  # Print the mapping for verification with p-values
+  cat("\n📊 Significance annotations mapping:\n")
+  cat("Regular vs College:", annotations[1], 
+      "(p =", ifelse(!is.na(p_lookup["Regular - College"]), 
+                     round(p_lookup["Regular - College"], 4), 
+                     round(p_lookup["College - Regular"], 4)), ")\n")
+  cat("Regular vs Other:", annotations[2], 
+      "(p =", ifelse(!is.na(p_lookup["Regular - Other"]), 
+                     round(p_lookup["Regular - Other"], 4), 
+                     round(p_lookup["Other - Regular"], 4)), ")\n")
+  cat("College vs Other:", annotations[3], 
+      "(p =", ifelse(!is.na(p_lookup["College - Other"]), 
+                     round(p_lookup["College - Other"], 4), 
+                     round(p_lookup["Other - College"], 4)), ")\n")
+  
+  return(list(kw = kw_result, dunn = dunn_result, annotations = annotations))
+}
+
+# Run tests on cleaned data
+force_test     <- run_kw_and_dunn(clean_force, "force_based", "Force-Based Factor")
+special_test   <- run_kw_and_dunn(clean_special, "special_study", "Special Study Factor")
+contemporary_test    <- run_kw_and_dunn(clean_contemporary, "contemporary_study", "contemporary Study Factor")
+inj_test       <- run_kw_and_dunn(clean_inj, "total_inj", "Total Injuries")
+incidents_test <- run_kw_and_dunn(clean_incidents, "total_incidents", "Total Incidents")
+
+# 🎨 Shared theme
+themed <- theme_minimal() + theme(
+  legend.position = "none",
+  plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+  axis.text.x = element_text(size = 14, face = "bold"),
+  axis.title.y = element_text(size = 12),
+  panel.grid.major.x = element_blank()
+)
+
+# 📈 Create plots using cleaned data
+p1 <- ggplot(clean_force, aes(x = agency_type3, y = force_based, fill = agency_type3)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+  geom_jitter(width = 0.15, alpha = 0.4, color = "black", size = 1.5) +
+  geom_signif(comparisons = comparisons, 
+              annotations = force_test$annotations,
+              step_increase = 0.1, textsize = 4) +
+  labs(title = "Force-Based Training", 
+       y = "Factor Score", 
+       x = NULL,
+       subtitle = "Outliers removed using 1.25×IQR") +
+  scale_fill_manual(values = fill_colors, guide = "none") + 
+  themed +
+  theme(plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"))
+
+p2 <- ggplot(clean_contemporary, aes(x = agency_type3, y = contemporary_study, fill = agency_type3)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+  geom_jitter(width = 0.15, alpha = 0.4, color = "black", size = 1.5) +
+  geom_signif(comparisons = comparisons, 
+              annotations = contemporary_test$annotations,
+              step_increase = 0.1, textsize = 4) +
+  labs(title = "Contemporary Policing Training", 
+       y = "Factor Score", 
+       x = NULL,
+       subtitle = "Outliers removed using 1.25×IQR") +
+  scale_fill_manual(values = fill_colors, guide = "none") + 
+  themed +
+  theme(plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"))
+
+p3 <- ggplot(clean_special, aes(x = agency_type3, y = special_study, fill = agency_type3)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+  geom_jitter(width = 0.15, alpha = 0.4, color = "black", size = 1.5) +
+  geom_signif(comparisons = comparisons, 
+              annotations = special_test$annotations,
+              step_increase = 0.1, textsize = 4) +
+  labs(title = "Special Topics Training", 
+       y = "Factor Score", 
+       x = NULL,
+       subtitle = "Outliers removed using 1.25×IQR") +
+  scale_fill_manual(values = fill_colors, guide = "none") + 
+  themed +
+  theme(plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"))
+
+p4 <- ggplot(clean_inj, aes(x = agency_type3, y = total_inj, fill = agency_type3)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+  geom_jitter(width = 0.15, alpha = 0.4, color = "black", size = 1.5) +
+  geom_signif(comparisons = comparisons, 
+              annotations = inj_test$annotations,
+              step_increase = 0.1, textsize = 4) +
+  labs(title = "Total Injuries", 
+       y = "Count", 
+       x = NULL,
+       subtitle = "Outliers removed using 1.25×IQR") +
+  scale_fill_manual(values = fill_colors, guide = "none") + 
+  themed +
+  theme(plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"))
+
+p5 <- ggplot(clean_incidents, aes(x = agency_type3, y = total_incidents, fill = agency_type3)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+  geom_jitter(width = 0.15, alpha = 0.4, color = "black", size = 1.5) +
+  geom_signif(comparisons = comparisons, 
+              annotations = incidents_test$annotations,
+              step_increase = 0.1, textsize = 4) +
+  labs(title = "Total Incidents", 
+       y = "Count", 
+       x = NULL,
+       subtitle = "Outliers removed using 1.25×IQR") +
+  scale_fill_manual(values = fill_colors, guide = "none") + 
+  themed +
+  theme(plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"))
+
+# 💾 Save: Training Factor Plots (600 DPI)
+training_plot <- (p1 | p2 | p3) + 
+  plot_layout(guides = "collect") + 
+  plot_annotation(title = "Training Factor Scores by Agency Type",
+                  theme = theme(plot.title = element_text(size = 18, hjust = 0.5, face = "bold"))) &
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12))
+
+ggsave("~/Downloads/training_factors_comparison.jpg",
+       plot = training_plot,
+       width = 18, height = 7, units = "in", dpi = 900)
+
+# 💾 Save: Outcome Variable Plots (600 DPI)
+outcome_plot <- (p4 | p5) + 
+  plot_layout(guides = "collect") + 
+  plot_annotation(title = "Injury and Incident Outcomes by Agency Type",
+                  theme = theme(plot.title = element_text(size = 18, hjust = 0.5, face = "bold"))) &
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12))
+
+ggsave("~/Downloads/outcomes_comparison.jpg",
+       plot = outcome_plot,
+       width = 14, height = 7, units = "in", dpi = 900)
+
+# 💾 Save: Combined All Variables Plot (600 DPI)
+all_plots <- (p1 | p2 | p3) / (p4 | p5 | plot_spacer()) +
+  plot_layout(guides = "collect") + 
+  plot_annotation(title = "Kruskal-Wallis Analysis: Training Factors and Outcomes by Agency Type",
+                  subtitle = "*** p < 0.001, ** p < 0.01, * p < 0.05, ns = not significant | Outliers removed using 1.25×IQR method",
+                  theme = theme(plot.title = element_text(size = 18, hjust = 0.5, face = "bold"),
+                                plot.subtitle = element_text(size = 12, hjust = 0.5, face = "italic"))) &
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12))
+
+ggsave("~/Downloads/all_variables_comparison.jpg",
+       plot = all_plots,
+       width = 20, height = 14, units = "in", dpi = 900)
+
+# 📊 Create summary statistics table for CLEANED data
+create_summary_table <- function(data_list, var_names, group_var = "agency_type3") {
+  summary_list <- list()
+  
+  for(i in seq_along(var_names)) {
+    var <- var_names[i]
+    df <- data_list[[i]]
+    
+    summary_stats <- df %>%
+      group_by(!!sym(group_var)) %>%
+      summarise(
+        Variable = var,
+        n = sum(!is.na(!!sym(var))),
+        Mean = round(mean(!!sym(var), na.rm = TRUE), 2),
+        SD = round(sd(!!sym(var), na.rm = TRUE), 2),
+        Median = round(median(!!sym(var), na.rm = TRUE), 2),
+        IQR = round(IQR(!!sym(var), na.rm = TRUE), 2)
+      )
+    summary_list[[var]] <- summary_stats
+  }
+  
+  bind_rows(summary_list)
+}
+
+# Generate summary table for cleaned data
+cleaned_data_list <- list(clean_force, clean_contemporary, clean_special, clean_inj, clean_incidents)
+all_vars <- c("force_based", "contemporary_study", "special_study", "total_inj", "total_incidents")
+summary_table_cleaned <- create_summary_table(cleaned_data_list, all_vars)
+
+# Also create summary for original data (with outliers)
+summary_table_original <- create_summary_table(list(data, data, data, data, data), all_vars)
+
+# Print formatted summary tables
+cat("\n\n📊 SUMMARY STATISTICS BY AGENCY TYPE (After Outlier Removal)\n")
+cat("=========================================================\n\n")
+print(summary_table_cleaned, n = Inf)
+
+cat("\n\n📊 SUMMARY STATISTICS BY AGENCY TYPE (Original Data)\n")
+cat("==================================================\n\n")
+print(summary_table_original, n = Inf)
+
+# Save summary tables as CSV
+write.csv(summary_table_cleaned, "~/Downloads/summary_statistics_cleaned.csv", row.names = FALSE)
+write.csv(summary_table_original, "~/Downloads/summary_statistics_original.csv", row.names = FALSE)
+
+# Create IQR bounds report
+create_iqr_report <- function(original_data, cleaned_list, var_names) {
+  report <- data.frame()
+  
+  for(i in seq_along(var_names)) {
+    var <- var_names[i]
+    clean_df <- cleaned_list[[i]]
+    
+    # Get counts from cleaned data
+    clean_counts <- clean_df %>%
+      group_by(agency_type3) %>%
+      summarise(Clean_N = n()) %>%
+      ungroup()
+    
+    # Calculate IQR bounds by group
+    iqr_bounds <- original_data %>%
+      group_by(agency_type3) %>%
+      summarise(
+        Variable = var,
+        Q1 = round(quantile(!!sym(var), 0.25, na.rm = TRUE), 2),
+        Q3 = round(quantile(!!sym(var), 0.75, na.rm = TRUE), 2),
+        IQR = round(IQR(!!sym(var), na.rm = TRUE), 2),
+        Lower_Bound = round(Q1 - 1.5 * IQR, 2),
+        Upper_Bound = round(Q3 + 1.5 * IQR, 2),
+        Original_N = n()
+      ) %>%
+      left_join(clean_counts, by = "agency_type3") %>%
+      mutate(
+        Clean_N = ifelse(is.na(Clean_N), 0, Clean_N),
+        Outliers_Removed = Original_N - Clean_N,
+        Pct_Removed = round(100 * (Original_N - Clean_N) / Original_N, 1)
+      )
+    
+    report <- bind_rows(report, iqr_bounds)
+  }
+  
+  return(report)
+}
+
+# Generate IQR report
+iqr_report <- create_iqr_report(data, cleaned_data_list, all_vars)
+
+cat("\n\n📊 IQR OUTLIER BOUNDS AND REMOVAL SUMMARY\n")
+cat("=========================================\n\n")
+print(iqr_report, digits = 2)
+
+# Save IQR report
+write.csv(iqr_report, "~/Downloads/iqr_outlier_report.csv", row.names = FALSE)
+
+cat("\n\n✅ Analysis complete! Files saved to Downloads folder:\n")
+cat("   - training_factors_comparison.jpg\n")
+cat("   - outcomes_comparison.jpg\n")
+cat("   - all_variables_comparison.jpg\n")
+cat("   - summary_statistics_cleaned.csv (after outlier removal)\n")
+cat("   - summary_statistics_original.csv (before outlier removal)\n")
+cat("   - iqr_outlier_report.csv\n\n")
+cat("📊 Factor analysis performed on full data\n")
+cat("📊 Outliers removed using 1.25×IQR method before statistical tests\n")
