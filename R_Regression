@@ -18,7 +18,7 @@ library(ggplot2)    # For visualization
 library(car)        # For VIF
 
 # Set the correct path based on your file info
-save_path <- "/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Post-Leoka (Second)/Analysis/R/"
+save_path <- "/Users
 
 # Verify the file exists
 file_path <- paste0(save_path, "Post_ImputedAug2_R.RData")
