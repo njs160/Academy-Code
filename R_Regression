@@ -1,12 +1,12 @@
-# COMPLETE NEGATIVE BINOMIAL ANALYSIS WITH ENHANCEMENTS
-# =====================================================
+# COMPLETE NEGATIVE BINOMIAL ANALYSIS WITH COOK'S D FOR ALL OUTCOMES
+# ===================================================================
 
 # Clear workspace
 rm(list = ls())
 
 # Load ALL required libraries first
 library(mice)       # For multiple imputation
-library(dplyr)      # For data manipulation and pipe operator
+library(dplyr)      # For data manipulation
 library(psych)      # For factor analysis
 library(MASS)       # For negative binomial
 library(pscl)       # For zero-inflated models
@@ -16,397 +16,45 @@ library(performance)# For model diagnostics
 library(texreg)     # For regression tables
 library(ggplot2)    # For visualization
 library(car)        # For VIF
+library(lavaan)     # For CFA
+library(semTools)   # For CFA tools
+library(openxlsx)   # For Excel export
 
-# Set the correct path based on your file info
-save_path <- "/Users
-
-# Verify the file exists
-file_path <- paste0(save_path, "Post_ImputedAug2_R.RData")
-cat("Checking file at:", file_path, "\n")
-
-if(file.exists(file_path)) {
-  cat("✓ File found!\n\n")
-  
-  # Load the data
-  cat("Loading data...\n")
-  load(file_path)
-  
-  # Check what was loaded
-  cat("\nObjects loaded:\n")
-  print(ls())
-  
-  # Assign data_imputed to data_final
-  if(exists("data_imputed")) {
-    data_final <- data_imputed
-    cat("\n✓ SUCCESS: Data loaded and assigned to data_final\n")
-    cat("Dimensions:", nrow(data_final), "rows x", ncol(data_final), "columns\n")
-    
-    # Check for multiple imputations
-    if(".imp" %in% names(data_final)) {
-      cat("Number of imputations:", max(data_final$.imp), "\n")
-      cat("Observations per imputation:", nrow(data_final[data_final$.imp == 1, ]), "\n")
-    }
-    
-    cat("\n=== READY TO PROCEED WITH ANALYSIS ===\n")
-  } else {
-    cat("\nWARNING: data_imputed not found in the loaded file\n")
-    cat("Available objects:", paste(ls(), collapse = ", "), "\n")
-  }
-} else {
-  cat("ERROR: File not found at specified path\n")
-  cat("Please check the path and try again\n")
-}
-
-# Set working directory
-setwd(save_path)
-cat("\nWorking directory set to:", getwd(), "\n")
-
-#-------------------------------------------
-# DEFINE MISSING FUNCTIONS
-#-------------------------------------------
-
-pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
-  # Extract imputed datasets
-  n_imp <- max(mi_data$.imp)
-  
-  # Initialize storage
-  model_list <- list()
-  theta_values <- numeric(n_imp)
-  aic_values <- numeric(n_imp)
-  bic_values <- numeric(n_imp)
-  
-  # Fit model on each imputed dataset
-  for(i in 1:n_imp) {
-    imp_data <- mi_data[mi_data$.imp == i, ]
-    
-    # Create formula
-    formula_str <- paste(outcome_var, "~", paste(predictors, collapse = " + "))
-    formula_obj <- as.formula(formula_str)
-    
-    tryCatch({
-      # Fit negative binomial model
-      model <- glm.nb(formula_obj, data = imp_data)
-      model_list[[i]] <- model
-      theta_values[i] <- model$theta
-      aic_values[i] <- AIC(model)
-      bic_values[i] <- BIC(model)
-    }, error = function(e) {
-      cat("  Error in imputation", i, ":", e$message, "\n")
-      return(NULL)
-    })
-  }
-  
-  # If no models succeeded, return NULL
-  if(length(model_list) == 0) {
-    return(NULL)
-  }
-  
-  # Pool results using Rubin's rules
-  n_params <- length(coef(model_list[[1]]))
-  pooled_estimates <- numeric(n_params)
-  pooled_se <- numeric(n_params)
-  param_names <- names(coef(model_list[[1]]))
-  
-  # Calculate pooled estimates
-  for(j in 1:n_params) {
-    # Get estimates from each imputation
-    estimates <- sapply(model_list, function(m) if(!is.null(m)) coef(m)[j] else NA)
-    variances <- sapply(model_list, function(m) if(!is.null(m)) vcov(m)[j,j] else NA)
-    
-    # Remove NAs
-    valid_estimates <- estimates[!is.na(estimates)]
-    valid_variances <- variances[!is.na(variances)]
-    n_valid <- length(valid_estimates)
-    
-    if(n_valid > 0) {
-      # Pooled estimate (mean of estimates)
-      pooled_estimates[j] <- mean(valid_estimates)
-      
-      # Within-imputation variance
-      within_var <- mean(valid_variances)
-      
-      # Between-imputation variance
-      between_var <- if(n_valid > 1) var(valid_estimates) else 0
-      
-      # Total variance (Rubin's rules)
-      total_var <- within_var + between_var + between_var/n_valid
-      pooled_se[j] <- sqrt(total_var)
-    } else {
-      pooled_estimates[j] <- NA
-      pooled_se[j] <- NA
-    }
-  }
-  
-  # Create summary dataframe
-  summary_df <- data.frame(
-    term = param_names,
-    estimate = pooled_estimates,
-    std.error = pooled_se,
-    statistic = pooled_estimates / pooled_se,
-    p.value = 2 * pnorm(-abs(pooled_estimates / pooled_se)),
-    IRR = exp(pooled_estimates),
-    IRR.lower = exp(pooled_estimates - 1.96 * pooled_se),
-    IRR.upper = exp(pooled_estimates + 1.96 * pooled_se),
-    stringsAsFactors = FALSE
-  )
-  
-  # Add significance stars
-  summary_df$stars <- case_when(
-    summary_df$p.value < 0.001 ~ "***",
-    summary_df$p.value < 0.01 ~ "**",
-    summary_df$p.value < 0.05 ~ "*",
-    summary_df$p.value < 0.1 ~ "†",
-    TRUE ~ ""
-  )
-  
-  # Calculate pseudo R-squared measures
-  # Use first imputation for null model
-  imp1_data <- mi_data[mi_data$.imp == 1, ]
-  null_model <- tryCatch({
-    glm.nb(as.formula(paste(outcome_var, "~ 1")), data = imp1_data)
-  }, error = function(e) NULL)
-  
-  if(!is.null(null_model)) {
-    # Average log-likelihoods
-    avg_loglik_full <- mean(sapply(model_list, function(m) if(!is.null(m)) logLik(m) else NA), na.rm = TRUE)
-    loglik_null <- logLik(null_model)
-    
-    # Pseudo R-squared calculations
-    n_obs <- nrow(imp1_data)
-    mcfadden <- 1 - (avg_loglik_full / loglik_null)
-    cox_snell <- 1 - exp(-2 * (avg_loglik_full - loglik_null) / n_obs)
-    nagelkerke <- cox_snell / (1 - exp(2 * loglik_null / n_obs))
-  } else {
-    mcfadden <- NA
-    cox_snell <- NA
-    nagelkerke <- NA
-    n_obs <- nrow(imp1_data)
-  }
-  
-  # Return results
-  return(list(
-    summary = summary_df,
-    pseudo_r2 = list(
-      mcfadden = mcfadden,
-      cox_snell = cox_snell,
-      nagelkerke = nagelkerke
-    ),
-    avg_theta = mean(theta_values, na.rm = TRUE),
-    avg_aic = mean(aic_values, na.rm = TRUE),
-    avg_bic = mean(bic_values, na.rm = TRUE),
-    n_obs = n_obs,
-    n_imp = n_imp
-  ))
-}
-
-calculate_vif_imputed <- function(mi_data, predictors, outcome_var) {
-  n_imp <- max(mi_data$.imp)
-  vif_list <- list()
-  
-  # Calculate VIF for each imputation
-  for(i in 1:n_imp) {
-    imp_data <- mi_data[mi_data$.imp == i, ]
-    
-    # Create formula
-    formula_str <- paste(outcome_var, "~", paste(predictors, collapse = " + "))
-    formula_obj <- as.formula(formula_str)
-    
-    tryCatch({
-      # Fit linear model for VIF calculation
-      lm_model <- lm(formula_obj, data = imp_data)
-      
-      # Calculate VIF
-      vif_values <- vif(lm_model)
-      vif_list[[i]] <- vif_values
-    }, error = function(e) {
-      cat("VIF calculation error in imputation", i, ":", e$message, "\n")
-    })
-  }
-  
-  # If no VIF calculations succeeded
-  if(length(vif_list) == 0) {
-    return(NULL)
-  }
-  
-  # Average VIF across imputations
-  all_vars <- names(vif_list[[1]])
-  avg_vif <- numeric(length(all_vars))
-  
-  for(j in 1:length(all_vars)) {
-    vif_values <- sapply(vif_list, function(v) if(!is.null(v) && all_vars[j] %in% names(v)) v[all_vars[j]] else NA)
-    avg_vif[j] <- mean(vif_values, na.rm = TRUE)
-  }
-  
-  # Create output dataframe
-  vif_df <- data.frame(
-    Variable = all_vars,
-    Avg_VIF = avg_vif,
-    stringsAsFactors = FALSE
-  )
-  
-  return(vif_df)
-}
-
-# Drop unwanted variables - BUT KEEP STATECODE
-drop_vars <- c("train_inserv", "train_special", "train_first", "train_field", "train_lateral", 
-               "train_pre", "train_night", "train_reserve", "pos_local", "pos_sher", "pos_camp", 
-               "pos_corr", "pos_ranger", "pos_sro", "pos_hwy", "pos_aux", "pos_pre", "pos_nat", 
-               "pos_arson", "pos_constable", "pos_transport", "pos_tribe", "pos_mar", "rno_self", 
-               "rno_local", "rno_sher", "rno_state", "rno_special", "rno_total")
-
-# Check if statecode exists before dropping variables
-if("statecode" %in% names(data_final)) {
-  cat("\n✓ statecode variable found in dataset\n")
-  cat("Number of unique states:", length(unique(data_final$statecode)), "\n")
-} else {
-  cat("\n✗ WARNING: statecode variable NOT found in dataset\n")
-  cat("Available variables containing 'state':\n")
-  state_vars <- names(data_final)[grepl("state", names(data_final), ignore.case = TRUE)]
-  if(length(state_vars) > 0) {
-    print(state_vars)
-  } else {
-    cat("No variables containing 'state' found\n")
-  }
-}
-
-data_final <- data_final[, !names(data_final) %in% drop_vars]
-
-####################################### OUTCOME: LEOKA #######################################
-
-# Create total incidents by weapon type
-data_final <- data_final %>%
-  mutate(
-    total_firearms = total_inj_firearms + total_noninj_firearms,
-    total_knife = total_inj_knife + total_noninj_knife,
-    total_other = total_inj_other + total_noninj_other,
-    total_hands = total_inj_hands + total_noninj_hands
-  )
-
-# Create total injuries and incidents
-data_final <- data_final %>%
-  mutate(
-    total_injuries = total_inj_firearms + total_inj_knife + total_inj_other + total_inj_hands,
-    total_incidents = total_firearms + total_knife + total_other + total_hands
-  )
-
-####################################### PREDICTOR: CLETA #######################################
-
-# Create instructor-to-cadet ratio
-data_final$instructor_ratio <- (data_final$ft_total + data_final$pt_total) / data_final$sex_start_total
-
-# Create total training hours across selected subjects
-training_subjects <- c("crim", "jjl", "traf_law", "study", "com_part", "cult", "medi", 
-                       "prob_solv", "map", "comm", "ethic", "prof", "stress", "cpr", 
-                       "comp", "emv", "evid", "intel", "intero", "inv", "pat", "rep", 
-                       "traf", "judo", "def_tac", "fire_skill", "nonl", "victim", 
-                       "domv", "opioid", "mental", "htraf", "emr", "dui", "gang")
-
-data_final$total_studyhours <- rowSums(data_final[training_subjects], na.rm = TRUE)
-
-# Fail Metrics
-data_final$eth_completion_rate <- data_final$eth_comp_total / data_final$eth_start_total
-data_final$fail_total <- data_final$fail_total_m + data_final$fail_total_f
-data_final$fail_phys_total <- data_final$fail_phys_m + data_final$fail_phys_f
-data_final$fail_academic_total <- data_final$fail_acad_m + data_final$fail_acad_f
-
-# Firearm Range recode
-data_final$firerange <- as.numeric(data_final$in_fire_1 == 1 | data_final$out_fire_1 == 1)
-
-####################################### CONTROL: UCR data #######################################
-
-data_final$total_clearviolent <- data_final$total_cleared_murder + data_final$total_cleared_robbery + 
-                                 data_final$total_cleared_assault + data_final$total_cleared_burglary
-
-data_final$violentclearance_rate <- ifelse(data_final$total_violent > 0, 
-                                           (data_final$total_clearviolent / data_final$total_violent) * 100, 
-                                           NA)
-# COMPLETE NEGATIVE BINOMIAL ANALYSIS WITH ENHANCEMENTS
-# =====================================================
-
-# Clear workspace
-rm(list = ls())
-
-# Load ALL required libraries first
-library(mice)       # For multiple imputation
-library(dplyr)      # For data manipulation and pipe operator
-library(psych)      # For factor analysis
-library(MASS)       # For negative binomial
-library(pscl)       # For zero-inflated models
-library(lmtest)     # For likelihood ratio tests
-library(AER)        # For dispersion tests
-library(performance)# For model diagnostics
-library(texreg)     # For regression tables
-library(ggplot2)    # For visualization
-library(car)        # For VIF
-
-# Set the correct path based on your file info
+# Set paths
 save_path <- "/Users/nasseralsabah/Desktop/PhD/John Jay/Research/Academy/Post-Leoka (Second)/Analysis/R/"
+downloads_path <- "~/Downloads/"
 
-# Verify the file exists
+# Load and prepare data
 file_path <- paste0(save_path, "Post_ImputedAug2_R.RData")
-cat("Checking file at:", file_path, "\n")
+cat("Loading data from:", file_path, "\n")
+load(file_path)
+data_final <- data_imputed
 
-if(file.exists(file_path)) {
-  cat("✓ File found!\n\n")
-  
-  # Load the data
-  cat("Loading data...\n")
-  load(file_path)
-  
-  # Check what was loaded
-  cat("\nObjects loaded:\n")
-  print(ls())
-  
-  # Assign data_imputed to data_final
-  if(exists("data_imputed")) {
-    data_final <- data_imputed
-    cat("\n✓ SUCCESS: Data loaded and assigned to data_final\n")
-    cat("Dimensions:", nrow(data_final), "rows x", ncol(data_final), "columns\n")
-    
-    # Check for multiple imputations
-    if(".imp" %in% names(data_final)) {
-      cat("Number of imputations:", max(data_final$.imp), "\n")
-      cat("Observations per imputation:", nrow(data_final[data_final$.imp == 1, ]), "\n")
-    }
-    
-    cat("\n=== READY TO PROCEED WITH ANALYSIS ===\n")
-  } else {
-    cat("\nWARNING: data_imputed not found in the loaded file\n")
-    cat("Available objects:", paste(ls(), collapse = ", "), "\n")
-  }
-} else {
-  cat("ERROR: File not found at specified path\n")
-  cat("Please check the path and try again\n")
-}
+cat("\n✓ Data loaded successfully\n")
+cat("Dimensions:", nrow(data_final), "rows x", ncol(data_final), "columns\n")
+cat("Number of imputations:", max(data_final$.imp), "\n")
+cat("Observations per imputation:", nrow(data_final[data_final$.imp == 1, ]), "\n")
 
 # Set working directory
 setwd(save_path)
-cat("\nWorking directory set to:", getwd(), "\n")
 
 #-------------------------------------------
-# DEFINE MISSING FUNCTIONS
+# DEFINE HELPER FUNCTIONS
 #-------------------------------------------
 
 pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
-  # Extract imputed datasets
   n_imp <- max(mi_data$.imp)
-  
-  # Initialize storage
   model_list <- list()
   theta_values <- numeric(n_imp)
   aic_values <- numeric(n_imp)
   bic_values <- numeric(n_imp)
   
-  # Fit model on each imputed dataset
   for(i in 1:n_imp) {
     imp_data <- mi_data[mi_data$.imp == i, ]
-    
-    # Create formula
     formula_str <- paste(outcome_var, "~", paste(predictors, collapse = " + "))
     formula_obj <- as.formula(formula_str)
     
     tryCatch({
-      # Fit negative binomial model
       model <- glm.nb(formula_obj, data = imp_data)
       model_list[[i]] <- model
       theta_values[i] <- model$theta
@@ -418,10 +66,7 @@ pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
     })
   }
   
-  # If no models succeeded, return NULL
-  if(length(model_list) == 0) {
-    return(NULL)
-  }
+  if(length(model_list) == 0) return(NULL)
   
   # Pool results using Rubin's rules
   n_params <- length(coef(model_list[[1]]))
@@ -429,28 +74,18 @@ pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
   pooled_se <- numeric(n_params)
   param_names <- names(coef(model_list[[1]]))
   
-  # Calculate pooled estimates
   for(j in 1:n_params) {
-    # Get estimates from each imputation
     estimates <- sapply(model_list, function(m) if(!is.null(m)) coef(m)[j] else NA)
     variances <- sapply(model_list, function(m) if(!is.null(m)) vcov(m)[j,j] else NA)
     
-    # Remove NAs
     valid_estimates <- estimates[!is.na(estimates)]
     valid_variances <- variances[!is.na(variances)]
     n_valid <- length(valid_estimates)
     
     if(n_valid > 0) {
-      # Pooled estimate (mean of estimates)
       pooled_estimates[j] <- mean(valid_estimates)
-      
-      # Within-imputation variance
       within_var <- mean(valid_variances)
-      
-      # Between-imputation variance
       between_var <- if(n_valid > 1) var(valid_estimates) else 0
-      
-      # Total variance (Rubin's rules)
       total_var <- within_var + between_var + between_var/n_valid
       pooled_se[j] <- sqrt(total_var)
     } else {
@@ -472,7 +107,6 @@ pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
     stringsAsFactors = FALSE
   )
   
-  # Add significance stars
   summary_df$stars <- case_when(
     summary_df$p.value < 0.001 ~ "***",
     summary_df$p.value < 0.01 ~ "**",
@@ -481,19 +115,15 @@ pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
     TRUE ~ ""
   )
   
-  # Calculate pseudo R-squared measures
-  # Use first imputation for null model
+  # Calculate pseudo R-squared
   imp1_data <- mi_data[mi_data$.imp == 1, ]
   null_model <- tryCatch({
     glm.nb(as.formula(paste(outcome_var, "~ 1")), data = imp1_data)
   }, error = function(e) NULL)
   
   if(!is.null(null_model)) {
-    # Average log-likelihoods
     avg_loglik_full <- mean(sapply(model_list, function(m) if(!is.null(m)) logLik(m) else NA), na.rm = TRUE)
     loglik_null <- logLik(null_model)
-    
-    # Pseudo R-squared calculations
     n_obs <- nrow(imp1_data)
     mcfadden <- 1 - (avg_loglik_full / loglik_null)
     cox_snell <- 1 - exp(-2 * (avg_loglik_full - loglik_null) / n_obs)
@@ -505,7 +135,6 @@ pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
     n_obs <- nrow(imp1_data)
   }
   
-  # Return results
   return(list(
     summary = summary_df,
     pseudo_r2 = list(
@@ -521,79 +150,181 @@ pooled_nb_regression_enhanced <- function(mi_data, outcome_var, predictors) {
   ))
 }
 
-calculate_vif_imputed <- function(mi_data, predictors, outcome_var) {
-  n_imp <- max(mi_data$.imp)
-  vif_list <- list()
+cook_d_cleaning <- function(data, outcomes, predictors) {
+  if(".imp" %in% names(data)) {
+    imp_nums <- unique(data$.imp)
+    imp_nums <- imp_nums[imp_nums > 0]
+  } else {
+    imp_nums <- 1
+    data$.imp <- 1
+  }
   
-  # Calculate VIF for each imputation
-  for(i in 1:n_imp) {
-    imp_data <- mi_data[mi_data$.imp == i, ]
-    
-    # Create formula
-    formula_str <- paste(outcome_var, "~", paste(predictors, collapse = " + "))
-    formula_obj <- as.formula(formula_str)
-    
-    tryCatch({
-      # Fit linear model for VIF calculation
-      lm_model <- lm(formula_obj, data = imp_data)
+  for(dv in outcomes) {
+    if(dv %in% names(data)) {
+      print(paste(">>> Processing Cook's D for", dv))
       
-      # Calculate VIF
-      vif_values <- vif(lm_model)
-      vif_list[[i]] <- vif_values
-    }, error = function(e) {
-      cat("VIF calculation error in imputation", i, ":", e$message, "\n")
-    })
+      data[[paste0("cooksd_", dv)]] <- NA
+      data[[paste0("cleaned_", dv)]] <- data[[dv]]
+      
+      for(m in imp_nums) {
+        mask <- data$.imp == m
+        subset_data <- data[mask, c(dv, predictors), drop = FALSE]
+        complete_cases <- complete.cases(subset_data)
+        
+        if(sum(complete_cases) > length(predictors) + 1) {
+          N <- sum(complete_cases)
+          cutoff <- 4 / N
+          
+          tryCatch({
+            formula_str <- paste(dv, "~", paste(predictors, collapse = " + "))
+            model <- lm(as.formula(formula_str), data = subset_data[complete_cases, ])
+            cooksd_values <- cooks.distance(model)
+            
+            cooksd_full <- rep(NA, sum(mask))
+            cooksd_full[complete_cases] <- cooksd_values
+            data[[paste0("cooksd_", dv)]][mask] <- cooksd_full
+            
+            high_influence <- cooksd_full > cutoff & !is.na(cooksd_full)
+            data[[paste0("cleaned_", dv)]][mask][high_influence] <- NA
+            
+            print(paste("  Imputation", m, ": Removed", sum(high_influence, na.rm = TRUE), 
+                       "high-influence cases out of", N, "(cutoff =", round(cutoff, 6), ")"))
+            
+          }, error = function(e) {
+            warning(paste("Cook's D calculation failed for", dv, "in imputation", m, ":", e$message))
+          })
+        }
+      }
+    }
   }
   
-  # If no VIF calculations succeeded
-  if(length(vif_list) == 0) {
-    return(NULL)
-  }
-  
-  # Average VIF across imputations
-  all_vars <- names(vif_list[[1]])
-  avg_vif <- numeric(length(all_vars))
-  
-  for(j in 1:length(all_vars)) {
-    vif_values <- sapply(vif_list, function(v) if(!is.null(v) && all_vars[j] %in% names(v)) v[all_vars[j]] else NA)
-    avg_vif[j] <- mean(vif_values, na.rm = TRUE)
-  }
-  
-  # Create output dataframe
-  vif_df <- data.frame(
-    Variable = all_vars,
-    Avg_VIF = avg_vif,
-    stringsAsFactors = FALSE
-  )
-  
-  return(vif_df)
+  return(data)
 }
 
-# Drop unwanted variables - BUT KEEP STATECODE
+calculate_avg_n <- function(data, outcome_var) {
+  n_imp <- max(data$.imp)
+  n_per_imp <- numeric(n_imp)
+  
+  for(i in 1:n_imp) {
+    imp_data <- data[data$.imp == i, ]
+    n_per_imp[i] <- sum(!is.na(imp_data[[outcome_var]]))
+  }
+  
+  return(round(mean(n_per_imp)))
+}
+
+# Fixed VIF calculation function
+calculate_pooled_vif <- function(data, predictors) {
+  cat("\n=== VARIANCE INFLATION FACTOR (VIF) CHECK ===\n")
+  cat("Checking for multicollinearity across imputations...\n\n")
+  
+  # Get first imputation data
+  imp1_data <- data[data$.imp == 1, ]
+  
+  # Select only the predictors we need
+  vif_data <- imp1_data[, predictors, drop = FALSE]
+  
+  # Remove rows with any missing values
+  vif_data <- vif_data[complete.cases(vif_data), ]
+  
+  # Create a fake outcome variable
+  vif_data$fake_y <- rnorm(nrow(vif_data))
+  
+  # Create formula
+  formula_str <- paste("fake_y ~", paste(predictors, collapse = " + "))
+  
+  # Fit model
+  tryCatch({
+    model <- lm(as.formula(formula_str), data = vif_data)
+    
+    # Calculate VIF - handle both regular and GVIF for factors
+    vif_raw <- vif(model)
+    
+    # Check if we have GVIF (for factors with >2 levels)
+    if(is.matrix(vif_raw)) {
+      # For factors, use GVIF^(1/(2*Df))
+      vif_values <- vif_raw[, "GVIF^(1/(2*Df))"]^2  # Square to get comparable values
+      names(vif_values) <- rownames(vif_raw)
+    } else {
+      vif_values <- vif_raw
+    }
+    
+    # Create summary table
+    vif_summary <- data.frame(
+      Predictor = names(vif_values),
+      VIF = round(vif_values, 2),
+      stringsAsFactors = FALSE
+    )
+    
+    # Sort by VIF value
+    vif_summary <- vif_summary[order(vif_summary$VIF, decreasing = TRUE), ]
+    
+    # Print results
+    print(vif_summary, row.names = FALSE)
+    
+    # Identify problematic predictors
+    high_vif <- vif_summary$VIF > 10
+    if(any(high_vif)) {
+      cat("\n⚠ WARNING: The following predictors have VIF > 10:\n")
+      print(vif_summary[high_vif, ], row.names = FALSE)
+    } else {
+      cat("\n✓ All VIF values are below 10 (no severe multicollinearity detected)\n")
+    }
+    
+    moderate_vif <- vif_summary$VIF > 5 & vif_summary$VIF <= 10
+    if(any(moderate_vif)) {
+      cat("\n⚠ Note: The following predictors have VIF between 5-10 (moderate multicollinearity):\n")
+      print(vif_summary[moderate_vif, ], row.names = FALSE)
+    }
+    
+    return(vif_summary)
+    
+  }, error = function(e) {
+    cat("Error calculating VIF:", e$message, "\n")
+    
+    # Try alternative approach - calculate correlation matrix for numeric variables
+    cat("\nAttempting correlation-based diagnostics for numeric variables...\n")
+    
+    # Get only numeric predictors
+    numeric_preds <- predictors[sapply(vif_data[predictors], is.numeric)]
+    
+    if(length(numeric_preds) > 1) {
+      cor_matrix <- cor(vif_data[numeric_preds], use = "complete.obs")
+      
+      # Find high correlations
+      high_cor <- which(abs(cor_matrix) > 0.7 & cor_matrix != 1, arr.ind = TRUE)
+      
+      if(nrow(high_cor) > 0) {
+        cat("\nHigh correlations (|r| > 0.7) found between:\n")
+        for(i in 1:nrow(high_cor)) {
+          if(high_cor[i, 1] < high_cor[i, 2]) {  # Only print each pair once
+            cat(sprintf("  %s <-> %s: r = %.3f\n",
+                       rownames(cor_matrix)[high_cor[i, 1]],
+                       colnames(cor_matrix)[high_cor[i, 2]],
+                       cor_matrix[high_cor[i, 1], high_cor[i, 2]]))
+          }
+        }
+      } else {
+        cat("\nNo high correlations (|r| > 0.7) found among numeric predictors.\n")
+      }
+    }
+    
+    return(NULL)
+  })
+}
+
+# Drop unwanted variables
 drop_vars <- c("train_inserv", "train_special", "train_first", "train_field", "train_lateral", 
                "train_pre", "train_night", "train_reserve", "pos_local", "pos_sher", "pos_camp", 
                "pos_corr", "pos_ranger", "pos_sro", "pos_hwy", "pos_aux", "pos_pre", "pos_nat", 
                "pos_arson", "pos_constable", "pos_transport", "pos_tribe", "pos_mar", "rno_self", 
                "rno_local", "rno_sher", "rno_state", "rno_special", "rno_total")
 
-# Check if statecode exists before dropping variables
-if("statecode" %in% names(data_final)) {
-  cat("\n✓ statecode variable found in dataset\n")
-  cat("Number of unique states:", length(unique(data_final$statecode)), "\n")
-} else {
-  cat("\n✗ WARNING: statecode variable NOT found in dataset\n")
-  cat("Available variables containing 'state':\n")
-  state_vars <- names(data_final)[grepl("state", names(data_final), ignore.case = TRUE)]
-  if(length(state_vars) > 0) {
-    print(state_vars)
-  } else {
-    cat("No variables containing 'state' found\n")
-  }
-}
-
 data_final <- data_final[, !names(data_final) %in% drop_vars]
 
-####################################### OUTCOME: LEOKA #######################################
+#-------------------------------------------
+# CREATE OUTCOME VARIABLES
+#-------------------------------------------
 
 # Create total incidents by weapon type
 data_final <- data_final %>%
@@ -601,22 +332,19 @@ data_final <- data_final %>%
     total_firearms = total_inj_firearms + total_noninj_firearms,
     total_knife = total_inj_knife + total_noninj_knife,
     total_other = total_inj_other + total_noninj_other,
-    total_hands = total_inj_hands + total_noninj_hands
-  )
-
-# Create total injuries and incidents
-data_final <- data_final %>%
-  mutate(
+    total_hands = total_inj_hands + total_noninj_hands,
     total_injuries = total_inj_firearms + total_inj_knife + total_inj_other + total_inj_hands,
     total_incidents = total_firearms + total_knife + total_other + total_hands
   )
 
-####################################### PREDICTOR: CLETA #######################################
+#-------------------------------------------
+# CREATE PREDICTOR VARIABLES
+#-------------------------------------------
 
-# Create instructor-to-cadet ratio
+# Instructor ratio
 data_final$instructor_ratio <- (data_final$ft_total + data_final$pt_total) / data_final$sex_start_total
 
-# Create total training hours across selected subjects
+# Total training hours
 training_subjects <- c("crim", "jjl", "traf_law", "study", "com_part", "cult", "medi", 
                        "prob_solv", "map", "comm", "ethic", "prof", "stress", "cpr", 
                        "comp", "emv", "evid", "intel", "intero", "inv", "pat", "rep", 
@@ -625,143 +353,73 @@ training_subjects <- c("crim", "jjl", "traf_law", "study", "com_part", "cult", "
 
 data_final$total_studyhours <- rowSums(data_final[training_subjects], na.rm = TRUE)
 
-# Fail Metrics
+# Fail metrics
 data_final$eth_completion_rate <- data_final$eth_comp_total / data_final$eth_start_total
-data_final$fail_total <- data_final$fail_total_m + data_final$fail_total_f
 data_final$fail_phys_total <- data_final$fail_phys_m + data_final$fail_phys_f
 data_final$fail_academic_total <- data_final$fail_acad_m + data_final$fail_acad_f
+# NOT creating fail_total as requested
 
-# Firearm Range recode
+# Firearm range
 data_final$firerange <- as.numeric(data_final$in_fire_1 == 1 | data_final$out_fire_1 == 1)
 
-####################################### CONTROL: UCR data #######################################
-
+# UCR data
 data_final$total_clearviolent <- data_final$total_cleared_murder + data_final$total_cleared_robbery + 
                                  data_final$total_cleared_assault + data_final$total_cleared_burglary
 
 data_final$violentclearance_rate <- ifelse(data_final$total_violent > 0, 
                                            (data_final$total_clearviolent / data_final$total_violent) * 100, 
                                            NA)
-# INSERT THIS CODE AFTER CREATING violentclearance_rate (around line 145)
-# AND BEFORE THE "KEEP ONLY NEEDED VARIABLES" SECTION
 
 #-------------------------------------------
-# REMOVE OUTLIER OBSERVATIONS (Clearance > 100%)
+# REMOVE CLEARANCE RATE OUTLIERS
 #-------------------------------------------
 
-cat("\n================================================\n")
-cat("REMOVING OUTLIER OBSERVATIONS\n")
-cat("================================================\n\n")
-
-# Store original dimensions
+cat("\n=== REMOVING CLEARANCE RATE OUTLIERS ===\n")
 original_rows <- nrow(data_final)
-original_unique <- length(unique(data_final$.id))
-
-cat("Original data:\n")
-cat("  Total rows:", original_rows, "\n")
-cat("  Unique observations:", original_unique, "\n\n")
-
-# Identify observations with clearance rate > 100%
-# First, get the first imputation to identify problematic cases
 data_imp1 <- data_final[data_final$.imp == 1, ]
+high_clearance_mask <- !is.na(data_imp1$violentclearance_rate) & data_imp1$violentclearance_rate > 100
 
-# Find observations with clearance > 100%
-high_clearance_mask <- !is.na(data_imp1$violentclearance_rate) & 
-                       data_imp1$violentclearance_rate > 100
-
-# Get their .id values
 if(sum(high_clearance_mask) > 0) {
   problem_ids <- data_imp1$.id[high_clearance_mask]
-  
-  cat("Found", length(problem_ids), "observations with clearance rate > 100%:\n")
-  
-  # Show details of what we're removing
-  for(id in problem_ids) {
-    obs_data <- data_imp1[data_imp1$.id == id, ]
-    cat(sprintf("  ID %d: Clearance = %.1f%% (Violent crimes: %d, Cleared: %d)\n",
-                id,
-                obs_data$violentclearance_rate,
-                obs_data$total_violent,
-                obs_data$total_clearviolent))
-  }
-  
-  # Remove these observations from ALL imputations
-  cat("\nRemoving these observations from all", max(data_final$.imp), "imputations...\n")
+  cat("Found", length(problem_ids), "observations with clearance rate > 100%\n")
   data_final <- data_final[!data_final$.id %in% problem_ids, ]
-  
-  # Verify removal
-  new_rows <- nrow(data_final)
-  new_unique <- length(unique(data_final$.id))
-  
-  cat("\nAfter removal:\n")
-  cat("  Total rows:", new_rows, "(removed", original_rows - new_rows, ")\n")
-  cat("  Unique observations:", new_unique, "(removed", original_unique - new_unique, ")\n")
-  
-  # Double-check no high clearance rates remain
-  data_check <- data_final[data_final$.imp == 1, ]
-  remaining_high <- sum(data_check$violentclearance_rate > 100, na.rm = TRUE)
-  
-  if(remaining_high == 0) {
-    cat("\n✓ SUCCESS: All observations with clearance > 100% removed\n")
-  } else {
-    cat("\n⚠ WARNING:", remaining_high, "observations with clearance > 100% remain\n")
-  }
-  
-} else {
-  cat("No observations found with clearance rate > 100%\n")
-  cat("No removal necessary\n")
+  cat("After removal:", nrow(data_final[data_final$.imp == 1, ]), "observations per imputation\n")
 }
 
-cat("\n================================================\n\n")
-
 #-------------------------------------------
-# 1) KEEP ONLY NEEDED VARIABLES
+# KEEP ONLY NEEDED VARIABLES
 #-------------------------------------------
 
 keeplist <- c(
-  # Multiple imputation variables
   ".imp", ".id",
-  # Core variables
   "total_firearms", "total_knife", "total_other", "total_hands",
-  "fail_phys_total", "fail_academic_total", "eth_comp_total", "fail_total",
+  "fail_phys_total", "fail_academic_total", "eth_comp_total",
   "total_inj_hands", "total_inj_knife", "total_inj_firearms", "total_inj_other",
   "total_injuries", "total_incidents",
   "instructor_ratio",
   "basic_lgth_hours", "ft_sworn", "ft_civ", "ebudget", "opbudget", "mean_officers",
   "total_studyhours", "total_violent", "field_man", "environment_3", "agency_type3", "min_ed_bin",
   "fitness_1", "obstacle_1", "firerange", "scenario_1", "refresher",
-  "htraf", "emv", "pat", "judo", "def_tac", "fire_skill", "nonl", "acsh",
-  "medi", "prob_solv", "lang", "comm", "ethic", "stress", "prof", "hate", "cult",
+  "htraf", "emv", "pat", "judo", "def_tac", "fire_skill", "nonl",
+  "medi", "prob_solv", "comm", "ethic", "stress", "prof", "cult",
   "crim", "jjl", "traf_law", "domv", "gang", "victim", "com_part",
   "total_cleared_murder", "total_cleared_robbery", "total_cleared_assault", "total_cleared_burglary",
   "total_clearviolent", "violentclearance_rate",
-  "statecode"  # ADDED STATECODE HERE
+  "statecode"
 )
 
-# Keep only variables that exist in the dataset
 keeplist <- keeplist[keeplist %in% names(data_final)]
 data_final <- data_final[, keeplist]
 
-print("Variables kept:")
-print(names(data_final))
-
-# Verify statecode is still there
-if("statecode" %in% names(data_final)) {
-  cat("\n✓ statecode successfully retained in dataset\n")
-} else {
-  cat("\n✗ statecode was not retained - it may not exist in the original data\n")
-}
-
 #-------------------------------------------
-# 2) Z-score standardization
+# Z-SCORE STANDARDIZATION
 #-------------------------------------------
 
-# Variables to standardize
 standardize_vars <- c("basic_lgth_hours", "ft_sworn", "ft_civ", "ebudget", "opbudget", 
                      "mean_officers", "total_studyhours", "total_violent", "total_clearviolent",
-                     "fail_phys_total", "fail_academic_total", "fail_total")
+                     "fail_phys_total", "fail_academic_total")
+# Removed "fail_total" from standardization
 
-# Function to standardize within each imputation
 standardize_imputed <- function(data, vars) {
   if(".imp" %in% names(data)) {
     imp_nums <- unique(data$.imp)
@@ -791,11 +449,10 @@ standardize_imputed <- function(data, vars) {
   return(data)
 }
 
-# Apply standardization
 data_final <- standardize_imputed(data_final, standardize_vars)
 
 #-------------------------------------------
-# Convert categorical variables to factors
+# CONVERT CATEGORICAL VARIABLES TO FACTORS
 #-------------------------------------------
 
 if("field_man" %in% names(data_final)) {
@@ -816,15 +473,14 @@ if("agency_type3" %in% names(data_final)) {
   data_final$agency_type3 <- as.factor(data_final$agency_type3)
 }
 
+# Create binary overseeing agency variable (college vs traditional)
+# Collapse "Other" (3) into "Traditional" (1)
+data_final$agency_college <- ifelse(data_final$agency_type3 == "2", 1, 0)
+
 #-------------------------------------------
-# 3) Factor score generation
+# FACTOR SCORE GENERATION (CFA)
 #-------------------------------------------
 
-# Load required libraries for CFA
-library(lavaan)
-library(semTools)
-
-# Function to perform CFA within each imputation
 perform_cfa_analysis <- function(data, vars, factor_name) {
   if(".imp" %in% names(data)) {
     imp_nums <- unique(data$.imp)
@@ -848,35 +504,21 @@ perform_cfa_analysis <- function(data, vars, factor_name) {
     if(sum(complete_cases) > length(vars)) {
       cfa_data <- subset_data[complete_cases, , drop = FALSE]
       
-      # Define CFA model
       items <- paste(vars, collapse = " + ")
       cfa_model <- paste0(factor_name, " =~ ", items)
       
       tryCatch({
-        # Fit CFA model
-        cfa_fit <- cfa(cfa_model, 
-                      data = cfa_data, 
-                      std.lv = TRUE,
-                      estimator = "MLR")
-        
-        # Extract fit indices
-        fit_indices <- fitMeasures(cfa_fit, 
-                                  c("chisq", "df", "pvalue",
-                                    "cfi", "tli", "rmsea",
-                                    "rmsea.ci.lower", "rmsea.ci.upper",
-                                    "srmr"))
-        
+        cfa_fit <- cfa(cfa_model, data = cfa_data, std.lv = TRUE, estimator = "MLR")
+        fit_indices <- fitMeasures(cfa_fit, c("chisq", "df", "pvalue", "cfi", "tli", "rmsea", 
+                                              "rmsea.ci.lower", "rmsea.ci.upper", "srmr"))
         all_fit_indices[[length(all_fit_indices) + 1]] <- fit_indices
         
-        # Extract factor scores
         factor_scores <- rep(NA, sum(mask))
         factor_scores[complete_cases] <- lavPredict(cfa_fit, method = "regression")[,1]
         data[[factor_name]][mask] <- factor_scores
         
       }, error = function(e) {
-        # Fallback to EFA if CFA fails
-        warning(paste("CFA failed for", factor_name, "in imputation", imp, 
-                     "- using EFA:", e$message))
+        warning(paste("CFA failed for", factor_name, "in imputation", imp))
         
         tryCatch({
           fa_result <- fa(cfa_data, nfactors = 1, rotate = "none", scores = "regression")
@@ -890,572 +532,39 @@ perform_cfa_analysis <- function(data, vars, factor_name) {
     }
   }
   
-  # Report pooled fit indices
-  if(length(all_fit_indices) > 0) {
-    if(length(all_fit_indices) > 1) {
-      fit_matrix <- do.call(rbind, all_fit_indices)
-      pooled_fits <- colMeans(fit_matrix, na.rm = TRUE)
-    } else {
-      pooled_fits <- all_fit_indices[[1]]
-    }
-    
-    cat("\n", factor_name, "- Pooled Model Fit:\n")
-    cat(sprintf("  χ²(%d) = %.2f, p = %.3f\n", 
-               pooled_fits["df"], 
-               pooled_fits["chisq"], 
-               pooled_fits["pvalue"]))
-    cat(sprintf("  CFI = %.3f, TLI = %.3f\n", 
-               pooled_fits["cfi"], 
-               pooled_fits["tli"]))
-    cat(sprintf("  RMSEA = %.3f [%.3f, %.3f]\n", 
-               pooled_fits["rmsea"], 
-               pooled_fits["rmsea.ci.lower"], 
-               pooled_fits["rmsea.ci.upper"]))
-    cat(sprintf("  SRMR = %.3f\n", pooled_fits["srmr"]))
-  }
-  
   return(data)
 }
 
-# Create factors with REVISED variables based on your table
-cat("\n========== CONFIRMATORY FACTOR ANALYSIS ==========\n")
+cat("\n=== CREATING FACTOR SCORES ===\n")
 
-# Force-based Instruction (using only 4 variables as per your revised model)
+# Force-based Instruction
 force_vars <- c("emv", "def_tac", "fire_skill", "nonl")
 force_vars <- force_vars[force_vars %in% names(data_final)]
 if(length(force_vars) > 0) {
-  cat("\nForce-Based Instruction Factor\n")
-  cat("Variables:", paste(force_vars, collapse=", "), "\n")
   data_final <- perform_cfa_analysis(data_final, force_vars, "force_based")
 }
 
-# Contemporary Policing Studies (using only 4 variables as per your revised model)
+# Contemporary Policing Studies
 modern_vars <- c("comm", "ethic", "prof", "cult")
 modern_vars <- modern_vars[modern_vars %in% names(data_final)]
 if(length(modern_vars) > 0) {
-  cat("\nContemporary Policing Studies Factor\n")
-  cat("Variables:", paste(modern_vars, collapse=", "), "\n")
   data_final <- perform_cfa_analysis(data_final, modern_vars, "contemporary_policing")
-  
-  # Create composite score as alternative due to poor fit
-  cat("Note: Creating composite score as alternative due to high RMSEA\n")
   temp_data <- data_final[, modern_vars]
   data_final$contemporary_policing_composite <- rowMeans(temp_data, na.rm = TRUE)
 }
 
-# Special Topics Study (all 4 variables)
+# Special Topics Study
 special_vars <- c("jjl", "traf_law", "domv", "victim")
 special_vars <- special_vars[special_vars %in% names(data_final)]
 if(length(special_vars) > 0) {
-  cat("\nSpecial Topics Study Factor\n")
-  cat("Variables:", paste(special_vars, collapse=", "), "\n")
   data_final <- perform_cfa_analysis(data_final, special_vars, "special_study")
 }
 
-cat("\n========== FIT INDICES SUMMARY ==========\n")
-cat("Recommended cutoffs:\n")
-cat("  CFI ≥ 0.95 (good), ≥ 0.90 (acceptable)\n")
-cat("  TLI ≥ 0.95 (good), ≥ 0.90 (acceptable)\n")
-cat("  RMSEA ≤ 0.06 (good), ≤ 0.08 (acceptable)\n")
-cat("  SRMR ≤ 0.08 (good)\n")
-cat("\nNote: Contemporary Policing Studies shows poor fit (high RMSEA).\n")
-cat("Consider using contemporary_policing_composite in analyses.\n")
-
 #-------------------------------------------
-# COMPREHENSIVE SUMMARY STATISTICS BEFORE MODELING
+# DEFINE PREDICTORS
 #-------------------------------------------
 
-cat("\n", strrep("=", 80), "\n")
-cat("COMPREHENSIVE SUMMARY STATISTICS BEFORE MODELING\n")
-cat(strrep("=", 80), "\n\n")
-
-# 1. OUTCOME VARIABLES SUMMARY
-cat("1. OUTCOME VARIABLES DISTRIBUTION\n")
-cat(strrep("-", 60), "\n\n")
-
-# Create summary for all outcomes
-summary_outcomes <- data.frame()
-
-# Get all outcome variables
-all_outcomes <- c(
-  # Injury outcomes
-  "total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries",
-  # Incident outcomes (cleaned)
-  "cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", 
-  "cleaned_total_hands", "cleaned_total_incidents"
-)
-
-# Calculate statistics for each outcome
-for(outcome in all_outcomes) {
-  if(outcome %in% names(data_final)) {
-    # Use first imputation for summary
-    outcome_data <- data_final[[outcome]][data_final$.imp == 1]
-    
-    # Calculate percentiles
-    percentiles <- quantile(outcome_data, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
-    
-    summary_outcomes <- rbind(summary_outcomes, data.frame(
-      Variable = outcome,
-      Type = ifelse(grepl("inj", outcome), "Injury", "Incident"),
-      N = sum(!is.na(outcome_data)),
-      Mean = round(mean(outcome_data, na.rm = TRUE), 2),
-      SD = round(sd(outcome_data, na.rm = TRUE), 2),
-      Min = min(outcome_data, na.rm = TRUE),
-      Q25 = round(percentiles[1], 2),
-      Median = round(percentiles[2], 2),
-      Q75 = round(percentiles[3], 2),
-      Max = max(outcome_data, na.rm = TRUE),
-      Zeros = sum(outcome_data == 0, na.rm = TRUE),
-      Zero_Pct = round(sum(outcome_data == 0, na.rm = TRUE) / sum(!is.na(outcome_data)) * 100, 1)
-    ))
-  }
-}
-
-print(summary_outcomes, row.names = FALSE)
-
-# 2. PREDICTOR VARIABLES SUMMARY
-cat("\n\n2. PREDICTOR VARIABLES DISTRIBUTION\n")
-cat(strrep("-", 60), "\n\n")
-
-# Continuous predictors (standardized)
-continuous_preds <- c(
-  "z_basic_lgth_hours", "z_ebudget", "z_opbudget", "z_ft_sworn", "z_ft_civ",
-  "z_mean_officers", "z_total_violent", "violentclearance_rate",
-  "z_fail_phys_total", "z_fail_academic_total", "z_fail_total"
-)
-
-# Factor scores
-factor_preds <- c("force_based", "contemporary_policing_composite", "special_study")
-
-summary_predictors <- data.frame()
-
-for(pred in c(continuous_preds, factor_preds)) {
-  if(pred %in% names(data_final)) {
-    pred_data <- data_final[[pred]][data_final$.imp == 1]
-    
-    summary_predictors <- rbind(summary_predictors, data.frame(
-      Variable = pred,
-      N = sum(!is.na(pred_data)),
-      Mean = round(mean(pred_data, na.rm = TRUE), 3),
-      SD = round(sd(pred_data, na.rm = TRUE), 3),
-      Min = round(min(pred_data, na.rm = TRUE), 3),
-      Median = round(median(pred_data, na.rm = TRUE), 3),
-      Max = round(max(pred_data, na.rm = TRUE), 3),
-      Missing = sum(is.na(pred_data)),
-      Missing_Pct = round(sum(is.na(pred_data)) / length(pred_data) * 100, 1)
-    ))
-  }
-}
-
-print(summary_predictors, row.names = FALSE)
-
-# 3. CATEGORICAL PREDICTORS SUMMARY
-cat("\n\n3. CATEGORICAL VARIABLES DISTRIBUTION\n")
-cat(strrep("-", 60), "\n\n")
-
-categorical_vars <- c("field_man", "environment_3", "agency_type3", "min_ed_bin",
-                     "fitness_1", "obstacle_1", "firerange", "scenario_1", "refresher", "region")
-
-for(var in categorical_vars) {
-  if(var %in% names(data_final)) {
-    cat("\n", var, ":\n")
-    # Use first imputation
-    var_data <- data_final[[var]][data_final$.imp == 1]
-    tbl <- table(var_data, useNA = "ifany")
-    prop_tbl <- round(prop.table(table(var_data)) * 100, 1)
-    
-    # Combine count and percentage
-    for(level in names(tbl)) {
-      if(!is.na(level)) {
-        pct <- ifelse(level %in% names(prop_tbl), prop_tbl[level], 0)
-        cat(sprintf("  %s: %d (%.1f%%)\n", level, tbl[level], pct))
-      } else {
-        cat(sprintf("  Missing: %d\n", tbl[is.na(names(tbl))]))
-      }
-    }
-  }
-}
-
-# 4. CORRELATION MATRIX FOR KEY CONTINUOUS VARIABLES
-cat("\n\n4. CORRELATION MATRIX (Key Continuous Variables)\n")
-cat(strrep("-", 60), "\n\n")
-
-# Select key continuous variables for correlation
-cor_vars <- c("z_basic_lgth_hours", "z_ebudget", "z_opbudget", 
-              "z_ft_sworn", "z_mean_officers", "z_total_violent")
-
-if(all(cor_vars %in% names(data_final))) {
-  # Use first imputation
-  cor_data <- data_final[data_final$.imp == 1, cor_vars]
-  cor_matrix <- cor(cor_data, use = "pairwise.complete.obs")
-  
-  # Round and display
-  cor_matrix_rounded <- round(cor_matrix, 3)
-  print(cor_matrix_rounded)
-  
-  # Identify high correlations (> 0.7)
-  high_cor <- which(abs(cor_matrix) > 0.7 & cor_matrix != 1, arr.ind = TRUE)
-  if(nrow(high_cor) > 0) {
-    cat("\nHigh correlations (|r| > 0.7):\n")
-    for(i in 1:nrow(high_cor)) {
-      if(high_cor[i, 1] < high_cor[i, 2]) {  # Avoid duplicates
-        cat(sprintf("  %s - %s: r = %.3f\n",
-                   rownames(cor_matrix)[high_cor[i, 1]],
-                   colnames(cor_matrix)[high_cor[i, 2]],
-                   cor_matrix[high_cor[i, 1], high_cor[i, 2]]))
-      }
-    }
-  }
-}
-
-# 5. SAMPLE SIZE AND IMPUTATION SUMMARY
-cat("\n\n5. SAMPLE SIZE AND IMPUTATION DETAILS\n")
-cat(strrep("-", 60), "\n\n")
-
-n_imputations <- max(data_final$.imp)
-n_obs_per_imp <- nrow(data_final[data_final$.imp == 1, ])
-
-cat("Number of imputations:", n_imputations, "\n")
-cat("Observations per imputation:", n_obs_per_imp, "\n")
-cat("Total rows in dataset:", nrow(data_final), "\n")
-
-# Check for any remaining high clearance rates
-if("violentclearance_rate" %in% names(data_final)) {
-  data_check <- data_final[data_final$.imp == 1, ]
-  high_clearance <- sum(data_check$violentclearance_rate > 100, na.rm = TRUE)
-  cat("Observations with clearance rate > 100%:", high_clearance, "\n")
-}
-
-# 6. ZERO-INFLATION ASSESSMENT
-cat("\n\n6. ZERO-INFLATION ASSESSMENT\n")
-cat(strrep("-", 60), "\n\n")
-
-cat("Percentage of zeros in outcome variables:\n")
-for(outcome in all_outcomes) {
-  if(outcome %in% names(data_final)) {
-    outcome_data <- data_final[[outcome]][data_final$.imp == 1]
-    zero_pct <- sum(outcome_data == 0, na.rm = TRUE) / sum(!is.na(outcome_data)) * 100
-    cat(sprintf("  %-25s: %.1f%%\n", outcome, zero_pct))
-  }
-}
-
-# 7. COOK'S D OUTLIER REMOVAL SUMMARY
-cat("\n\n7. OUTLIER REMOVAL SUMMARY (Cook's D)\n")
-cat(strrep("-", 60), "\n\n")
-
-# Compare original vs cleaned for incident outcomes
-original_incidents <- c("total_firearms", "total_knife", "total_other", "total_hands")
-cleaned_incidents <- c("cleaned_total_firearms", "cleaned_total_knife", 
-                       "cleaned_total_other", "cleaned_total_hands")
-
-for(i in 1:length(original_incidents)) {
-  if(original_incidents[i] %in% names(data_final) && 
-     cleaned_incidents[i] %in% names(data_final)) {
-    
-    orig_data <- data_final[[original_incidents[i]]][data_final$.imp == 1]
-    clean_data <- data_final[[cleaned_incidents[i]]][data_final$.imp == 1]
-    
-    n_removed <- sum(!is.na(orig_data) & is.na(clean_data))
-    pct_removed <- n_removed / sum(!is.na(orig_data)) * 100
-    
-    cat(sprintf("%s:\n", original_incidents[i]))
-    cat(sprintf("  Original N: %d, After cleaning: %d\n", 
-                sum(!is.na(orig_data)), sum(!is.na(clean_data))))
-    cat(sprintf("  Removed: %d (%.1f%%)\n", n_removed, pct_removed))
-  }
-}
-
-cat("\n", strrep("=", 80), "\n")
-cat("END OF SUMMARY STATISTICS - PROCEEDING TO MODELS\n")
-cat(strrep("=", 80), "\n\n")
-
-#-------------------------------------------
-# COMPREHENSIVE DESCRIPTIVE STATISTICS TABLE
-#-------------------------------------------
-
-cat("\n", strrep("=", 80), "\n")
-cat("COMPREHENSIVE DESCRIPTIVE STATISTICS TABLE\n")
-cat(strrep("=", 80), "\n\n")
-
-# Get number of imputations
-n_imp <- max(data_final$.imp)
-
-# Function to format continuous variables as "Mean (SD), Min-Max"
-format_continuous <- function(data, var_name, n_imp) {
-  means <- numeric(n_imp)
-  sds <- numeric(n_imp)
-  mins <- numeric(n_imp)
-  maxs <- numeric(n_imp)
-  
-  for(i in 1:n_imp) {
-    imp_data <- data[[var_name]][data$.imp == i]
-    means[i] <- mean(imp_data, na.rm = TRUE)
-    sds[i] <- sd(imp_data, na.rm = TRUE)
-    mins[i] <- min(imp_data, na.rm = TRUE)
-    maxs[i] <- max(imp_data, na.rm = TRUE)
-  }
-  
-  # Pool using Rubin's rules
-  pooled_mean <- mean(means)
-  within_var <- mean(sds^2)
-  between_var <- var(means)
-  total_var <- within_var + between_var + between_var/n_imp
-  pooled_sd <- sqrt(total_var)
-  
-  sprintf("%.2f (%.2f), %.0f-%.0f", 
-          pooled_mean, pooled_sd, mean(mins), mean(maxs))
-}
-
-# Function to format categorical variables as "N (%)"
-format_categorical <- function(data, var_name, n_imp) {
-  all_levels <- sort(unique(data[[var_name]][!is.na(data[[var_name]])]))
-  results <- list()
-  
-  for(level in all_levels) {
-    counts <- numeric(n_imp)
-    props <- numeric(n_imp)
-    
-    for(i in 1:n_imp) {
-      imp_data <- data[[var_name]][data$.imp == i]
-      counts[i] <- sum(imp_data == level, na.rm = TRUE)
-      props[i] <- mean(imp_data == level, na.rm = TRUE) * 100
-    }
-    
-    avg_count <- round(mean(counts))
-    avg_prop <- round(mean(props))
-    results[[as.character(level)]] <- sprintf("%d (%d%%)", avg_count, avg_prop)
-  }
-  
-  return(results)
-}
-
-# Initialize results table
-results <- list()
-
-cat("SECTION | VARIABLE | VALUE\n")
-cat(strrep("-", 80), "\n")
-
-# OUTCOME VARIABLES
-cat("\nOUTCOME VARIABLES:\n\n")
-cat("Officer Incidents\n")
-
-# Original incident variables (without Cook's D)
-incident_vars <- c(
-  "total_firearms" = "  Firearms Incidents",
-  "total_knife" = "  Knife Incidents", 
-  "total_other" = "  Other Weapon Incidents",
-  "total_hands" = "  Hands/Feet Incidents",
-  "total_incidents" = "  Total Incidents"
-)
-
-for(var in names(incident_vars)) {
-  if(var %in% names(data_final)) {
-    value <- format_continuous(data_final, var, n_imp)
-    cat(sprintf("%-30s %s\n", incident_vars[var], value))
-  }
-}
-
-cat("\nInjuries\n")
-injury_vars <- c(
-  "total_inj_firearms" = "  Firearms Injuries",
-  "total_inj_knife" = "  Knife Injuries",
-  "total_inj_other" = "  Other Weapon Injuries",
-  "total_inj_hands" = "  Hands/Feet Injuries",
-  "total_injuries" = "  Total Injuries"
-)
-
-for(var in names(injury_vars)) {
-  if(var %in% names(data_final)) {
-    value <- format_continuous(data_final, var, n_imp)
-    cat(sprintf("%-30s %s\n", injury_vars[var], value))
-  }
-}
-
-# ACADEMY STRUCTURE
-cat("\nACADEMY STRUCTURE:\n\n")
-
-# Continuous academy variables (use original, not z-scored)
-if("basic_lgth_hours" %in% names(data_final)) {
-  value <- format_continuous(data_final, "basic_lgth_hours", n_imp)
-  cat(sprintf("%-30s %s\n", "  Basic Training Length", value))
-}
-
-# Field Training Requirements
-if("field_man" %in% names(data_final)) {
-  cat("\nField Training Requirements:\n")
-  results <- format_categorical(data_final, "field_man", n_imp)
-  labels <- c("3" = "  Not Required", "1" = "  Required For Some", "2" = "  Required For All")
-  for(level in names(results)) {
-    if(level %in% names(labels)) {
-      cat(sprintf("%-30s %s\n", labels[level], results[[level]]))
-    }
-  }
-}
-
-# Stress Environment
-if("environment_3" %in% names(data_final)) {
-  cat("\nSelf-Reported Stress Environment:\n")
-  results <- format_categorical(data_final, "environment_3", n_imp)
-  labels <- c("1" = "  Low", "2" = "  Medium", "3" = "  High")
-  for(level in names(results)) {
-    if(level %in% names(labels)) {
-      cat(sprintf("%-30s %s\n", labels[level], results[[level]]))
-    }
-  }
-}
-
-# Budgets
-if("ebudget" %in% names(data_final)) {
-  value <- format_continuous(data_final, "ebudget", n_imp)
-  cat(sprintf("\n%-30s %s\n", "Equipment Budget", value))
-}
-
-if("opbudget" %in% names(data_final)) {
-  value <- format_continuous(data_final, "opbudget", n_imp)
-  cat(sprintf("%-30s %s\n", "Operational Budget", value))
-}
-
-# Overseeing Agency
-if("agency_type3" %in% names(data_final)) {
-  cat("\nOverseeing Agency:\n")
-  results <- format_categorical(data_final, "agency_type3", n_imp)
-  labels <- c("1" = "  State/Local Police", "2" = "  College/University", "3" = "  Other")
-  for(level in names(results)) {
-    if(level %in% names(labels)) {
-      cat(sprintf("%-30s %s\n", labels[level], results[[level]]))
-    }
-  }
-}
-
-# Failed metrics
-if("fail_phys_total" %in% names(data_final)) {
-  value <- format_continuous(data_final, "fail_phys_total", n_imp)
-  cat(sprintf("\n%-30s %s\n", "  Total Failed: Physical", value))
-}
-
-if("fail_academic_total" %in% names(data_final)) {
-  value <- format_continuous(data_final, "fail_academic_total", n_imp)
-  cat(sprintf("%-30s %s\n", "  Total Failed: Academic", value))
-}
-
-# Binary categorical variables
-binary_vars <- list(
-  "min_ed_bin" = c("Minimum Education", "No", "Yes"),
-  "fitness_1" = c("Fitness Facilities", "No", "Yes"),
-  "obstacle_1" = c("Obstacle Courses", "No", "Yes"),
-  "firerange" = c("Firing Range", "No", "Yes"),
-  "scenario_1" = c("Scenario Training", "No", "Yes")
-)
-
-for(var in names(binary_vars)) {
-  if(var %in% names(data_final)) {
-    cat(sprintf("\n%s:\n", binary_vars[[var]][1]))
-    results <- format_categorical(data_final, var, n_imp)
-    for(level in c("0", "1")) {
-      if(level %in% names(results)) {
-        label <- ifelse(level == "0", binary_vars[[var]][2], binary_vars[[var]][3])
-        cat(sprintf("  %-28s %s\n", label, results[[level]]))
-      }
-    }
-  }
-}
-
-# ACADEMY CURRICULUM
-cat("\nACADEMY CURRICULUM:\n\n")
-
-curriculum_vars <- c(
-  "emv" = "Emergency Vehicle Operations",
-  "pat" = "Patrol Procedures",
-  "judo" = "Self-Defense/Judo",
-  "def_tac" = "Defensive Tactics",
-  "fire_skill" = "Firearms Skills",
-  "nonl" = "Nonlethal Weapons",
-  "medi" = "Mediation",
-  "prob_solv" = "Problem Solving",
-  "comm" = "Communication Skills",
-  "ethic" = "Ethics And Integrity",
-  "prof" = "Professionalism",
-  "stress" = "Stress Management",
-  "crim" = "Criminal Law",
-  "htraf" = "Human Trafficking",
-  "jjl" = "Juvenile Justice Law",
-  "traf_law" = "Traffic Law",
-  "domv" = "Domestic Violence",
-  "gang" = "Gangs",
-  "victim" = "Victims' Rights",
-  "com_part" = "Community Partnerships"
-)
-
-for(var in names(curriculum_vars)) {
-  if(var %in% names(data_final)) {
-    value <- format_continuous(data_final, var, n_imp)
-    cat(sprintf("%-30s %s\n", curriculum_vars[var], value))
-  }
-}
-
-# Instructors
-if("ft_sworn" %in% names(data_final)) {
-  value <- format_continuous(data_final, "ft_sworn", n_imp)
-  cat(sprintf("\n%-30s %s\n", "Full-Time Sworn Instructors", value))
-}
-
-if("ft_civ" %in% names(data_final)) {
-  value <- format_continuous(data_final, "ft_civ", n_imp)
-  cat(sprintf("%-30s %s\n", "Full-Time Civilian Instructors", value))
-}
-
-# Refresher
-if("refresher" %in% names(data_final)) {
-  cat("\nInstructor Refresher Courses:\n")
-  results <- format_categorical(data_final, "refresher", n_imp)
-  for(level in c("0", "1")) {
-    if(level %in% names(results)) {
-      label <- ifelse(level == "0", "  No", "  Yes")
-      cat(sprintf("%-30s %s\n", label, results[[level]]))
-    }
-  }
-}
-
-# CONTROLS
-cat("\nCONTROLS:\n\n")
-
-if("mean_officers" %in% names(data_final)) {
-  value <- format_continuous(data_final, "mean_officers", n_imp)
-  cat(sprintf("%-30s %s\n", "Average Officers", value))
-}
-
-if("total_violent" %in% names(data_final)) {
-  value <- format_continuous(data_final, "total_violent", n_imp)
-  cat(sprintf("%-30s %s\n", "Total Violence Crime", value))
-}
-
-if("violentclearance_rate" %in% names(data_final)) {
-  value <- format_continuous(data_final, "violentclearance_rate", n_imp)
-  cat(sprintf("%-30s %s\n", "Violence Crime Clearance Rate", value))
-}
-
-# Regions
-if("region" %in% names(data_final)) {
-  cat("\nRegions:\n")
-  results <- format_categorical(data_final, "region", n_imp)
-  region_order <- c("South", "Northeast", "Midwest", "West")
-  for(region in region_order) {
-    if(region %in% names(results)) {
-      cat(sprintf("  %-28s %s\n", region, results[[region]]))
-    }
-  }
-}
-
-cat("\n", strrep("=", 80), "\n")
-cat("Note: All statistics pooled across", n_imp, "imputations\n")
-cat("Continuous variables: Mean (SD), Min-Max\n")
-cat("Categorical variables: N (%)\n")
-cat(strrep("=", 80), "\n")
-
-#-------------------------------------------
-# 4) Define comprehensive predictor list - FIXED TO USE CORRECT NAME
-#-------------------------------------------
-
+# Standard predictors for all models
 preds_full <- c(
   "z_basic_lgth_hours",
   "field_man",
@@ -1469,7 +578,7 @@ preds_full <- c(
   "scenario_1", 
   "refresher",
   "force_based", 
-  "contemporary_policing_composite",  # CHANGED from "modern_study" and using composite due to poor fit
+  "contemporary_policing_composite",
   "special_study",
   "z_ft_sworn", 
   "z_ft_civ",
@@ -1478,723 +587,76 @@ preds_full <- c(
   "z_total_violent",
   "violentclearance_rate",
   "z_fail_phys_total",
-  "z_fail_academic_total", 
-  "z_fail_total"
+  "z_fail_academic_total"
+  # REMOVED: "z_fail_total"
 )
 
-# Remove any predictors that don't exist
+# Special predictors for firearms injuries model (binary college variable)
+preds_firearms_injuries <- c(
+  "z_basic_lgth_hours",
+  "field_man",
+  "environment_3",
+  "z_ebudget", 
+  "z_opbudget",
+  "agency_college",  # Binary variable instead of agency_type3
+  "fitness_1", 
+  "obstacle_1", 
+  "firerange", 
+  "scenario_1", 
+  "refresher",
+  "force_based", 
+  "contemporary_policing_composite",
+  "special_study",
+  "z_ft_sworn", 
+  "z_ft_civ",
+  "min_ed_bin", 
+  "z_mean_officers", 
+  "z_total_violent",
+  "violentclearance_rate",
+  "z_fail_phys_total",
+  "z_fail_academic_total"
+)
+
 preds_full <- preds_full[preds_full %in% names(data_final)]
-
-print("Final predictors to be used:")
-print(preds_full)
+preds_firearms_injuries <- preds_firearms_injuries[preds_firearms_injuries %in% names(data_final)]
 
 #-------------------------------------------
-# 5) Cook's D removal of high-influence cases
+# RUN VIF CHECK BEFORE MODELS
 #-------------------------------------------
 
-dvs <- c("total_firearms", "total_knife", "total_other", "total_hands")
+# Check VIF for standard predictors
+vif_results <- calculate_pooled_vif(data_final, preds_full)
+
+# Check VIF for firearms injuries predictors
+cat("\n\n=== VIF CHECK FOR FIREARMS INJURIES MODEL ===\n")
+vif_results_firearms <- calculate_pooled_vif(data_final, preds_firearms_injuries)
+
+#-------------------------------------------
+# APPLY COOK'S D TO ALL OUTCOMES
+#-------------------------------------------
+
+cat("\n=== APPLYING COOK'S D TO ALL OUTCOMES ===\n")
+
+injury_dvs <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries")
+incident_dvs <- c("total_firearms", "total_knife", "total_other", "total_hands", "total_incidents")
+all_dvs <- c(injury_dvs, incident_dvs)
+
 preds_cooksd <- c("z_basic_lgth_hours", "z_ft_sworn", "z_ft_civ", "z_ebudget", "z_opbudget", "z_mean_officers")
 
-dvs <- dvs[dvs %in% names(data_final)]
-preds_cooksd <- preds_cooksd[preds_cooksd %in% names(data_final)]
+data_final <- cook_d_cleaning(data_final, all_dvs, preds_cooksd)
 
-# Cook's D cleaning function
-cook_d_cleaning <- function(data, outcomes, predictors) {
-  if(".imp" %in% names(data)) {
-    imp_nums <- unique(data$.imp)
-    imp_nums <- imp_nums[imp_nums > 0]
-  } else {
-    imp_nums <- 1
-    data$.imp <- 1
-  }
-  
-  for(dv in outcomes) {
-    if(dv %in% names(data)) {
-      print(paste(">>> Processing Cook's D for", dv))
-      
-      data[[paste0("cooksd_", dv)]] <- NA
-      data[[paste0("cleaned_", dv)]] <- data[[dv]]
-      
-      for(m in imp_nums) {
-        mask <- data$.imp == m
-        subset_data <- data[mask, c(dv, predictors), drop = FALSE]
-        complete_cases <- complete.cases(subset_data)
-        
-        if(sum(complete_cases) > length(predictors) + 1) {
-          N <- sum(complete_cases)
-          cutoff <- 4 / N
-          
-          tryCatch({
-            formula_str <- paste(dv, "~", paste(predictors, collapse = " + "))
-            model <- lm(as.formula(formula_str), data = subset_data[complete_cases, ])
-            cooksd_values <- cooks.distance(model)
-            
-            cooksd_full <- rep(NA, sum(mask))
-            cooksd_full[complete_cases] <- cooksd_values
-            data[[paste0("cooksd_", dv)]][mask] <- cooksd_full
-            
-            high_influence <- cooksd_full > cutoff & !is.na(cooksd_full)
-            data[[paste0("cleaned_", dv)]][mask][high_influence] <- NA
-            
-            print(paste("  Imputation", m, ": Removed", sum(high_influence, na.rm = TRUE), 
-                       "high-influence cases out of", N, "(cutoff =", round(cutoff, 6), ")"))
-            
-          }, error = function(e) {
-            warning(paste("Cook's D calculation failed for", dv, "in imputation", m, ":", e$message))
-          })
-        }
-      }
-    }
-  }
-  
-  return(data)
-}
-
-# Apply Cook's D cleaning
-data_final <- cook_d_cleaning(data_final, dvs, preds_cooksd)
-
-# Create cleaned total incidents
-data_final$cleaned_total_incidents <- rowSums(data_final[, paste0("cleaned_", dvs)], na.rm = TRUE)
-
-# Define cleaned outcomes
-cleaned_outcomes <- paste0("cleaned_", dvs)
-cleaned_outcomes <- cleaned_outcomes[cleaned_outcomes %in% names(data_final)]
-
-# COMPREHENSIVE NEGATIVE BINOMIAL ANALYSIS
-# =========================================
-# All injury and incident types plus totals
+cleaned_injury_outcomes <- paste0("cleaned_", injury_dvs)
+cleaned_incident_outcomes <- paste0("cleaned_", incident_dvs)
 
 #-------------------------------------------
-# SETUP AND FUNCTIONS
+# CREATE REGIONS
 #-------------------------------------------
 
-# Define all outcomes to analyze
-injury_outcomes <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries")
-incident_outcomes <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", "cleaned_total_hands", "cleaned_total_incidents")
-
-# Store all results
-all_nb_results <- list()
-
-#-------------------------------------------
-# RUN ALL MODELS
-#-------------------------------------------
-
-cat("\n", strrep("=", 80), "\n")
-cat("RUNNING COMPREHENSIVE NEGATIVE BINOMIAL MODELS\n")
-cat("Analyzing all injury types, incident types, and totals\n")
-cat(strrep("=", 80), "\n")
-
-# 1. Run models for all injury outcomes
-cat("\n>>> INJURY MODELS <<<\n")
-for(outcome in injury_outcomes) {
-  if(outcome %in% names(data_final)) {
-    cat("\nAnalyzing:", outcome, "\n")
-    
-    # Show distribution
-    tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-    cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-        "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-    
-    # Run model
-    nb_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_full)
-    
-    if(!is.null(nb_result)) {
-      all_nb_results[[outcome]] <- nb_result
-      cat("  ✓ Model completed successfully\n")
-    } else {
-      cat("  ✗ Model failed\n")
-    }
-  }
-}
-
-# 2. Run models for all incident outcomes
-cat("\n>>> INCIDENT MODELS <<<\n")
-for(outcome in incident_outcomes) {
-  if(outcome %in% names(data_final)) {
-    cat("\nAnalyzing:", outcome, "\n")
-    
-    # Show distribution
-    tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-    cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-        "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-    
-    # Run model
-    nb_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_full)
-    
-    if(!is.null(nb_result)) {
-      all_nb_results[[outcome]] <- nb_result
-      cat("  ✓ Model completed successfully\n")
-    } else {
-      cat("  ✗ Model failed\n")
-    }
-  }
-}
-
-#-------------------------------------------
-# CREATE COMPREHENSIVE COMPARISON TABLE WITH MCFADDEN'S R²
-#-------------------------------------------
-
-create_comprehensive_comparison <- function(results_list) {
-  cat("\n\n", strrep("=", 100), "\n")
-  cat("COMPREHENSIVE MODEL COMPARISON: ALL INJURY AND INCIDENT TYPES\n")
-  cat(strrep("=", 100), "\n")
-  
-  # Separate injury and incident models
-  injury_models <- results_list[names(results_list) %in% c("total_inj_firearms", "total_inj_knife", 
-                                                           "total_inj_other", "total_inj_hands", 
-                                                           "total_injuries")]
-  
-  incident_models <- results_list[names(results_list) %in% c("cleaned_total_firearms", "cleaned_total_knife", 
-                                                             "cleaned_total_other", "cleaned_total_hands", 
-                                                             "cleaned_total_incidents", "cleaned_total_injuries")]
-  
-  # Get all unique predictors
-  all_predictors <- c()
-  for(model_name in names(results_list)) {
-    if(!is.null(results_list[[model_name]])) {
-      all_predictors <- unique(c(all_predictors, results_list[[model_name]]$summary$term))
-    }
-  }
-  all_predictors <- all_predictors[all_predictors != "(Intercept)"]
-  all_predictors <- sort(all_predictors)
-  
-  # Print header for injuries
-  if(length(injury_models) > 0) {
-    cat("\n--- INJURY MODELS ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "Predictor"))
-    for(outcome in names(injury_models)) {
-      short_name <- gsub("total_inj_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs for injury models
-    for(pred in all_predictors) {
-      cat(sprintf("%-30s", substr(pred, 1, 30)))
-      
-      for(outcome in names(injury_models)) {
-        if(!is.null(injury_models[[outcome]])) {
-          sum_df <- injury_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        } else {
-          cat(sprintf(" %15s", "NA"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit for injuries - INCLUDING MCFADDEN'S R²
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "McFadden R²"))
-    for(outcome in names(injury_models)) {
-      if(!is.null(injury_models[[outcome]])) {
-        cat(sprintf(" %15.3f", injury_models[[outcome]]$pseudo_r2$mcfadden))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "Nagelkerke R²"))
-    for(outcome in names(injury_models)) {
-      if(!is.null(injury_models[[outcome]])) {
-        cat(sprintf(" %15.3f", injury_models[[outcome]]$pseudo_r2$nagelkerke))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "N"))
-    for(outcome in names(injury_models)) {
-      if(!is.null(injury_models[[outcome]])) {
-        cat(sprintf(" %15.0f", injury_models[[outcome]]$n_obs))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-  }
-  
-  # Print header for incidents
-  if(length(incident_models) > 0) {
-    cat("\n\n--- INCIDENT MODELS ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "Predictor"))
-    for(outcome in names(incident_models)) {
-      short_name <- gsub("cleaned_total_|cleaned_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs for incident models
-    for(pred in all_predictors) {
-      cat(sprintf("%-30s", substr(pred, 1, 30)))
-      
-      for(outcome in names(incident_models)) {
-        if(!is.null(incident_models[[outcome]])) {
-          sum_df <- incident_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        } else {
-          cat(sprintf(" %15s", "NA"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit for incidents - INCLUDING MCFADDEN'S R²
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "McFadden R²"))
-    for(outcome in names(incident_models)) {
-      if(!is.null(incident_models[[outcome]])) {
-        cat(sprintf(" %15.3f", incident_models[[outcome]]$pseudo_r2$mcfadden))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "Nagelkerke R²"))
-    for(outcome in names(incident_models)) {
-      if(!is.null(incident_models[[outcome]])) {
-        cat(sprintf(" %15.3f", incident_models[[outcome]]$pseudo_r2$nagelkerke))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "N"))
-    for(outcome in names(incident_models)) {
-      if(!is.null(incident_models[[outcome]])) {
-        cat(sprintf(" %15.0f", incident_models[[outcome]]$n_obs))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-  }
-  
-  cat(strrep("-", 100), "\n")
-  cat("Significance: *** p<0.001, ** p<0.01, * p<0.05, † p<0.1\n")
-}
-
-# Create the comprehensive comparison
-if(length(all_nb_results) > 0) {
-  create_comprehensive_comparison(all_nb_results)
-}
-
-#-------------------------------------------
-# VIF FOR POOLED MODEL
-#-------------------------------------------
-
-cat("\n\n", strrep("=", 80), "\n")
-cat("VARIANCE INFLATION FACTORS (VIF) - POOLED MODEL\n")
-cat(strrep("=", 80), "\n")
-
-# Calculate VIF using total incidents as outcome
-if("cleaned_total_incidents" %in% names(data_final)) {
-  vif_pooled <- calculate_vif_imputed(data_final, preds_full, "cleaned_total_incidents")
-  
-  if(!is.null(vif_pooled)) {
-    cat("\nVIF Summary (averaged across all imputations):\n")
-    cat(strrep("-", 60), "\n")
-    
-    # Show all VIF values sorted
-    vif_pooled <- vif_pooled[order(vif_pooled$Avg_VIF, decreasing = TRUE), ]
-    
-    for(i in 1:nrow(vif_pooled)) {
-      cat(sprintf("%-30s: %6.3f", vif_pooled$Variable[i], vif_pooled$Avg_VIF[i]))
-      if(vif_pooled$Avg_VIF[i] > 10) {
-        cat(" ***")
-      } else if(vif_pooled$Avg_VIF[i] > 5) {
-        cat(" **")
-      }
-      cat("\n")
-    }
-    
-    cat(strrep("-", 60), "\n")
-    cat("Note: *** = VIF > 10 (severe), ** = VIF > 5 (moderate)\n")
-    
-    # Quick summary
-    cat("\nMulticollinearity Summary:\n")
-    cat("- Highest VIF:", round(max(vif_pooled$Avg_VIF), 3), 
-        "(", vif_pooled$Variable[1], ")\n")
-    cat("- Variables with VIF > 10:", sum(vif_pooled$Avg_VIF > 10), "\n")
-    cat("- Variables with VIF > 5:", sum(vif_pooled$Avg_VIF > 5), "\n")
-  }
-}
-
-#-------------------------------------------
-# EXPORT ALL RESULTS
-#-------------------------------------------
-
-# Export comprehensive results
-if(length(all_nb_results) > 0) {
-  all_results_df <- data.frame()
-  
-  for(outcome in names(all_nb_results)) {
-    if(!is.null(all_nb_results[[outcome]])) {
-      df <- all_nb_results[[outcome]]$summary
-      df$outcome <- outcome
-      df$outcome_type <- ifelse(grepl("inj", outcome), "Injury", "Incident")
-      df$weapon_type <- case_when(
-        grepl("firearms", outcome) ~ "Firearms",
-        grepl("knife", outcome) ~ "Knife",
-        grepl("other", outcome) ~ "Other",
-        grepl("hands", outcome) ~ "Hands",
-        grepl("injuries", outcome) ~ "Total",
-        grepl("incidents", outcome) ~ "Total",
-        TRUE ~ "Unknown"
-      )
-      df$pseudo_r2_nagelkerke <- all_nb_results[[outcome]]$pseudo_r2$nagelkerke
-      df$pseudo_r2_mcfadden <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-      df$pseudo_r2_cox_snell <- all_nb_results[[outcome]]$pseudo_r2$cox_snell
-      df$theta <- all_nb_results[[outcome]]$avg_theta
-      df$aic <- all_nb_results[[outcome]]$avg_aic
-      df$bic <- all_nb_results[[outcome]]$avg_bic
-      df$n_obs <- all_nb_results[[outcome]]$n_obs
-      
-      all_results_df <- rbind(all_results_df, df)
-    }
-  }
-  
-  write.csv(all_results_df, 
-            paste0(save_path, "nb_comprehensive_all_outcomes_results.csv"), 
-            row.names = FALSE)
-  
-  cat("\n\n✓ Comprehensive results exported to: nb_comprehensive_all_outcomes_results.csv\n")
-}
-
-#-------------------------------------------
-# CREATE SUMMARY STATISTICS TABLE
-#-------------------------------------------
-
-cat("\n\n", strrep("=", 80), "\n")
-cat("SUMMARY STATISTICS FOR ALL OUTCOMES\n")
-cat(strrep("=", 80), "\n")
-
-# Create summary stats
-summary_stats <- data.frame(
-  Outcome = character(),
-  Type = character(),
-  Mean = numeric(),
-  SD = numeric(),
-  Min = numeric(),
-  Max = numeric(),
-  Zeros = numeric(),
-  N = numeric()
-)
-
-# Calculate for all outcomes
-all_outcomes <- c(injury_outcomes, incident_outcomes)
-for(outcome in all_outcomes) {
-  if(outcome %in% names(data_final)) {
-    # Use first imputation for summary stats
-    outcome_data <- data_final[[outcome]][data_final$.imp == 1]
-    
-    summary_stats <- rbind(summary_stats, data.frame(
-      Outcome = outcome,
-      Type = ifelse(grepl("inj", outcome), "Injury", "Incident"),
-      Mean = round(mean(outcome_data, na.rm = TRUE), 2),
-      SD = round(sd(outcome_data, na.rm = TRUE), 2),
-      Min = min(outcome_data, na.rm = TRUE),
-      Max = max(outcome_data, na.rm = TRUE),
-      Zeros = sum(outcome_data == 0, na.rm = TRUE),
-      N = sum(!is.na(outcome_data))
-    ))
-  }
-}
-
-print(summary_stats)
-
-# Save summary statistics
-write.csv(summary_stats, 
-          paste0(save_path, "nb_outcome_summary_statistics.csv"), 
-          row.names = FALSE)
-
-#-------------------------------------------
-# CREATE VISUALIZATION OF KEY PREDICTORS
-#-------------------------------------------
-
-# Function to create a heatmap-style visualization
-create_irr_heatmap <- function(results_list, top_n = 15) {
-  # Extract significant predictors across all models
-  sig_data <- data.frame()
-  
-  for(outcome in names(results_list)) {
-    if(!is.null(results_list[[outcome]])) {
-      df <- results_list[[outcome]]$summary
-      df <- df[df$p.value < 0.05 & df$term != "(Intercept)", ]
-      if(nrow(df) > 0) {
-        df$outcome <- outcome
-        df$outcome_clean <- gsub("cleaned_total_|total_inj_|total_", "", outcome)
-        df$log_irr <- log(df$IRR)
-        sig_data <- rbind(sig_data, df[, c("term", "outcome_clean", "IRR", "log_irr", "p.value")])
-      }
-    }
-  }
-  
-  if(nrow(sig_data) > 0) {
-    # Get top predictors by average absolute effect
-    top_preds <- sig_data %>%
-      group_by(term) %>%
-      summarise(avg_abs_effect = mean(abs(log_irr))) %>%
-      arrange(desc(avg_abs_effect)) %>%
-      head(top_n) %>%
-      pull(term)
-    
-    # Filter to top predictors
-    plot_data <- sig_data[sig_data$term %in% top_preds, ]
-    
-    # Clean names
-    plot_data$term_clean <- gsub("z_", "", plot_data$term)
-    plot_data$term_clean <- gsub("_", " ", plot_data$term_clean)
-    plot_data$term_clean <- gsub("agency type32", "Agency: College", plot_data$term_clean)
-    plot_data$term_clean <- gsub("agency type33", "Agency: Other", plot_data$term_clean)
-    plot_data$term_clean <- gsub("total clearviolent", "Violent Crimes Cleared", plot_data$term_clean)
-    plot_data$term_clean <- gsub("mean officers", "Mean Officers", plot_data$term_clean)
-    plot_data$term_clean <- gsub("ft sworn", "FT Sworn Instructors", plot_data$term_clean)
-    plot_data$term_clean <- gsub("contemporary policing composite", "Contemporary Policing", plot_data$term_clean)
-    
-    # Create plot
-    p <- ggplot(plot_data, aes(x = outcome_clean, y = term_clean, fill = log_irr)) +
-      geom_tile(color = "white", size = 0.5) +
-      geom_text(aes(label = sprintf("%.2f", IRR)), size = 3) +
-      scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
-                          midpoint = 0, limits = c(-1.5, 1.5),
-                          name = "Log(IRR)") +
-      labs(title = "Significant Predictors Across All Models",
-           subtitle = "Numbers show Incident Rate Ratios (p < 0.05)",
-           x = "Outcome Type",
-           y = NULL) +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1),
-            plot.title = element_text(hjust = 0.5, face = "bold"),
-            plot.subtitle = element_text(hjust = 0.5))
-    
-    ggsave(paste0(save_path, "irr_heatmap_all_models.png"), 
-           p, width = 12, height = 8, dpi = 300)
-    
-    cat("\n✓ IRR heatmap saved: irr_heatmap_all_models.png\n")
-  }
-}
-
-# Create the visualization
-if(length(all_nb_results) > 0) {
-  create_irr_heatmap(all_nb_results)
-}
-
-# =================================================
-# STATE EFFECTS ANALYSIS
-# =================================================
-
-cat("\n\n", strrep("=", 80), "\n")
-cat("STATE EFFECTS ANALYSIS\n")
-cat(strrep("=", 80), "\n")
-
-# First check if statecode exists in the data
-if("statecode" %in% names(data_final)) {
-  
-  # Convert statecode to factor if it isn't already
-  data_final$statecode <- as.factor(data_final$statecode)
-  
-  # Check number of states
-  n_states <- length(unique(data_final$statecode[!is.na(data_final$statecode)]))
-  cat("\nNumber of states in data:", n_states, "\n")
-  
-  # Create predictor list with state effects
-  preds_with_state <- c(preds_full, "statecode")
-  
-  # Store state effects results
-  state_effects_results <- list()
-  
-  cat("\n>>> RUNNING MODELS WITH STATE FIXED EFFECTS <<<\n")
-  cat("Note: This may take longer due to additional parameters\n\n")
-  
-  # Run models for key outcomes only (to save time)
-  key_outcomes <- c("total_injuries", "cleaned_total_incidents", 
-                    "total_inj_firearms", "cleaned_total_firearms")
-  
-  for(outcome in key_outcomes) {
-    if(outcome %in% names(data_final)) {
-      cat("\nAnalyzing with state effects:", outcome, "\n")
-      
-      # Show distribution
-      tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-      cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-          "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-      
-      # Run model with state effects
-      nb_state_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_with_state)
-      
-      if(!is.null(nb_state_result)) {
-        state_effects_results[[outcome]] <- nb_state_result
-        cat("  ✓ State effects model completed successfully\n")
-        
-        # Compare with base model
-        if(outcome %in% names(all_nb_results)) {
-          base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-          state_r2 <- nb_state_result$pseudo_r2$mcfadden
-          r2_improvement <- state_r2 - base_r2
-          
-          cat("  McFadden R² comparison:\n")
-          cat("    Base model: ", sprintf("%.4f", base_r2), "\n")
-          cat("    State model:", sprintf("%.4f", state_r2), "\n")
-          cat("    Improvement:", sprintf("%.4f", r2_improvement), 
-              "(", sprintf("%.1f%%", (r2_improvement/base_r2)*100), ")\n")
-        }
-      } else {
-        cat("  ✗ State effects model failed\n")
-      }
-    }
-  }
-  
-  # Create comparison table
-  if(length(state_effects_results) > 0) {
-    cat("\n\n", strrep("=", 80), "\n")
-    cat("MODEL COMPARISON: BASE vs. STATE FIXED EFFECTS\n")
-    cat(strrep("=", 80), "\n")
-    
-    comparison_df <- data.frame(
-      Outcome = character(),
-      Base_McFadden = numeric(),
-      State_McFadden = numeric(),
-      Improvement = numeric(),
-      Base_Nagelkerke = numeric(),
-      State_Nagelkerke = numeric(),
-      Base_AIC = numeric(),
-      State_AIC = numeric(),
-      stringsAsFactors = FALSE
-    )
-    
-    for(outcome in names(state_effects_results)) {
-      if(outcome %in% names(all_nb_results)) {
-        base_model <- all_nb_results[[outcome]]
-        state_model <- state_effects_results[[outcome]]
-        
-        comparison_df <- rbind(comparison_df, data.frame(
-          Outcome = outcome,
-          Base_McFadden = base_model$pseudo_r2$mcfadden,
-          State_McFadden = state_model$pseudo_r2$mcfadden,
-          Improvement = state_model$pseudo_r2$mcfadden - base_model$pseudo_r2$mcfadden,
-          Base_Nagelkerke = base_model$pseudo_r2$nagelkerke,
-          State_Nagelkerke = state_model$pseudo_r2$nagelkerke,
-          Base_AIC = base_model$avg_aic,
-          State_AIC = state_model$avg_aic,
-          stringsAsFactors = FALSE
-        ))
-      }
-    }
-    
-    print(comparison_df)
-    
-    # Save comparison
-    write.csv(comparison_df, 
-              paste0(save_path, "state_effects_comparison.csv"), 
-              row.names = FALSE)
-    
-    # Extract key predictors comparison - FIXED KEY PREDICTORS
-    cat("\n\n", strrep("=", 80), "\n")
-    cat("KEY PREDICTORS: BASE vs. STATE MODELS\n")
-    cat(strrep("=", 80), "\n")
-    cat("Showing how IRRs change when controlling for state effects\n\n")
-    
-    # Focus on a few key predictors - UPDATED WITH CORRECT NAME
-    key_preds <- c("z_basic_lgth_hours", "force_based", "contemporary_policing_composite", 
-                   "z_fail_total", "violentclearance_rate")
-    
-    for(pred in key_preds) {
-      cat("\n", pred, ":\n")
-      cat(sprintf("%-25s %10s %10s %10s\n", "Outcome", "Base IRR", "State IRR", "Change"))
-      cat(strrep("-", 60), "\n")
-      
-      for(outcome in names(state_effects_results)) {
-        if(outcome %in% names(all_nb_results)) {
-          base_sum <- all_nb_results[[outcome]]$summary
-          state_sum <- state_effects_results[[outcome]]$summary
-          
-          base_row <- base_sum[base_sum$term == pred, ]
-          state_row <- state_sum[state_sum$term == pred, ]
-          
-          if(nrow(base_row) > 0 && nrow(state_row) > 0) {
-            cat(sprintf("%-25s %10.3f%s %10.3f%s %10.1f%%\n",
-                       gsub("cleaned_total_|total_", "", outcome),
-                       base_row$IRR[1], base_row$stars[1],
-                       state_row$IRR[1], state_row$stars[1],
-                       ((state_row$IRR[1] - base_row$IRR[1])/base_row$IRR[1])*100))
-          }
-        }
-      }
-    }
-    
-    # Save full state effects results
-    state_results_df <- data.frame()
-    
-    for(outcome in names(state_effects_results)) {
-      if(!is.null(state_effects_results[[outcome]])) {
-        df <- state_effects_results[[outcome]]$summary
-        df$outcome <- outcome
-        df <- df[!grepl("statecode", df$term), ]  # Remove individual state coefficients
-        state_results_df <- rbind(state_results_df, df)
-      }
-    }
-    
-    write.csv(state_results_df, 
-              paste0(save_path, "nb_state_effects_results.csv"), 
-              row.names = FALSE)
-    
-    cat("\n\n✓ State effects analysis complete\n")
-    cat("✓ Files created:\n")
-    cat("  - state_effects_comparison.csv\n")
-    cat("  - nb_state_effects_results.csv\n")
-  }
-  
-} else {
-  cat("\nWARNING: 'statecode' variable not found in dataset\n")
-  cat("Cannot perform state effects analysis\n")
-}
-
-# Update the final summary message
-cat("\n\n", strrep("=", 80), "\n")
-cat("COMPREHENSIVE ANALYSIS COMPLETE\n")
-cat(strrep("=", 80), "\n")
-cat("\nFiles created:\n")
-cat("- nb_comprehensive_all_outcomes_results.csv (includes McFadden R²)\n")
-cat("- nb_outcome_summary_statistics.csv\n")
-cat("- irr_heatmap_all_models.png\n")
-if("statecode" %in% names(data_final)) {
-  cat("- state_effects_comparison.csv\n")
-  cat("- nb_state_effects_results.csv\n")
-}
-
-# Create regions based on actual state abbreviations
-# Using Census Bureau regional classifications
-
-# Define the regions
 northeast <- c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA")
 midwest <- c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD")
 south <- c("DE", "FL", "GA", "MD", "NC", "SC", "VA", "WV", "DC", "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX")
 west <- c("AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", "CA", "HI", "OR", "WA")
 
-# Create region variable
 data_final$region <- case_when(
   data_final$statecode %in% northeast ~ "Northeast",
   data_final$statecode %in% midwest ~ "Midwest",
@@ -2203,440 +665,64 @@ data_final$region <- case_when(
   TRUE ~ "Unknown"
 )
 
-# Convert to factor with South as reference (largest region)
 data_final$region <- factor(data_final$region, levels = c("South", "Northeast", "Midwest", "West"))
 
-# Check the regional distribution
-cat("\nRegional distribution:\n")
-print(table(data_final$region[data_final$.imp == 1]))
+#-------------------------------------------
+# RUN REGIONAL MODELS WITH CLEANED DATA
+#-------------------------------------------
 
-# Now run regional models
-cat("\n>>> RUNNING MODELS WITH REGIONAL FIXED EFFECTS <<<\n\n")
+cat("\n=== RUNNING REGIONAL MODELS WITH COOK'S D CLEANED DATA ===\n")
 
-# Define what we're testing - FIXED WITH CORRECT NAME
-outcomes <- c("total_injuries", "cleaned_total_incidents")
-predictors <- c("z_basic_lgth_hours", "force_based", "contemporary_policing_composite", 
-                "z_fail_total", "violentclearance_rate")
-
-# Store results
-regional_results <- list()
-
-# Run models
-for(outcome in outcomes) {
-  cat("Analyzing with regional effects:", outcome, "\n")
-  
-  # Show distribution
-  tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-  cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-      "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-  
-  # Run model with regions
-  regional_result <- pooled_nb_regression_enhanced(
-    data_final, 
-    outcome, 
-    c(predictors, "region")
-  )
-  
-  if(!is.null(regional_result)) {
-    regional_results[[outcome]] <- regional_result
-    cat("  ✓ Regional effects model completed successfully\n")
-    cat("  McFadden R²:", sprintf("%.4f", regional_result$pseudo_r2$mcfadden), "\n\n")
-  } else {
-    cat("  ✗ Regional effects model failed\n\n")
-  }
-}
-
-# Display results
-if(length(regional_results) > 0) {
-  cat("\n", strrep("=", 80), "\n")
-  cat("MODEL COMPARISON: BASE vs. STATE vs. REGIONAL FIXED EFFECTS\n")
-  cat(strrep("=", 80), "\n\n")
-  
-  # Create comparison table
-  for(outcome in names(regional_results)) {
-    if(outcome %in% names(all_nb_results) && 
-       outcome %in% names(state_effects_results)) {
-      
-      base_r2 <- all
-      
-      # Continue from where it left off...
-      base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-      state_r2 <- state_effects_results[[outcome]]$pseudo_r2$mcfadden
-      regional_r2 <- regional_results[[outcome]]$pseudo_r2$mcfadden
-      
-      cat(outcome, ":\n")
-      cat("  Base McFadden R²:     ", sprintf("%.4f", base_r2), "\n")
-      cat("  Regional McFadden R²: ", sprintf("%.4f", regional_r2), 
-          " (", sprintf("%+.1f%%", ((regional_r2 - base_r2)/base_r2)*100), ")\n")
-      cat("  State McFadden R²:    ", sprintf("%.4f", state_r2), 
-          " (", sprintf("%+.1f%%", ((state_r2 - base_r2)/base_r2)*100), ")\n\n")
-    }
-  }
-  
-  # Show regional effects
-  cat(strrep("=", 80), "\n")
-  cat("REGIONAL EFFECTS (IRRs relative to South)\n")
-  cat(strrep("=", 80), "\n")
-  
-  for(outcome in names(regional_results)) {
-    cat("\n", outcome, ":\n")
-    summary_df <- regional_results[[outcome]]$summary
-    region_rows <- summary_df[grepl("^region", summary_df$term), ]
-    
-    if(nrow(region_rows) > 0) {
-      print(region_rows[, c("term", "IRR", "IRR.lower", "IRR.upper", "p.value", "stars")])
-    }
-  }
-}
-
-# Re-run regional analysis with FULL predictor set for fair comparison
-cat("\n=== REGIONAL ANALYSIS WITH FULL PREDICTORS ===\n\n")
-
-# Run models with all predictors plus region
-regional_full_results <- list()
-
-for(outcome in c("total_injuries", "cleaned_total_incidents")) {
-  cat("Analyzing", outcome, "with full predictors + regional effects\n")
-  
-  # Run model with ALL predictors plus region
-  result <- pooled_nb_regression_enhanced(
-    data_final, 
-    outcome, 
-    c(preds_full, "region")
-  )
-  
-  if(!is.null(result)) {
-    regional_full_results[[outcome]] <- result
-    cat("✓ Model completed. McFadden R²:", round(result$pseudo_r2$mcfadden, 4), "\n")
-    
-    # Compare with base model
-    if(outcome %in% names(all_nb_results)) {
-      base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-      improvement <- result$pseudo_r2$mcfadden - base_r2
-      pct_imp <- (improvement / base_r2) * 100
-      cat("  Base R²:", round(base_r2, 4), 
-          "| Improvement:", round(improvement, 4),
-          "(", sprintf("%+.1f%%", pct_imp), ")\n\n")
-    }
-  }
-}
-
-# Create comprehensive comparison
-cat("\n", strrep("=", 80), "\n")
-cat("FAIR MODEL COMPARISON: All Models with Same Predictors\n")
-cat(strrep("=", 80), "\n\n")
-
-for(outcome in names(regional_full_results)) {
-  if(outcome %in% names(all_nb_results) && 
-     outcome %in% names(state_effects_results)) {
-    
-    base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-    regional_sparse_r2 <- regional_results[[outcome]]$pseudo_r2$mcfadden
-    regional_full_r2 <- regional_full_results[[outcome]]$pseudo_r2$mcfadden
-    state_r2 <- state_effects_results[[outcome]]$pseudo_r2$mcfadden
-    
-    cat(outcome, ":\n")
-    cat("  Base (full predictors):        ", sprintf("%.4f", base_r2), "\n")
-    cat("  Regional (5 predictors only):  ", sprintf("%.4f", regional_sparse_r2), 
-        sprintf(" (%+.1f%%)", ((regional_sparse_r2 - base_r2)/base_r2)*100), "\n")
-    cat("  Regional (full predictors):    ", sprintf("%.4f", regional_full_r2), 
-        sprintf(" (%+.1f%%)", ((regional_full_r2 - base_r2)/base_r2)*100), "\n")
-    cat("  State (full predictors):       ", sprintf("%.4f", state_r2), 
-        sprintf(" (%+.1f%%)", ((state_r2 - base_r2)/base_r2)*100), "\n\n")
-  }
-}
-
-# Show regional effects from full model
-cat(strrep("=", 80), "\n")
-cat("REGIONAL EFFECTS FROM FULL MODEL (IRRs relative to South)\n")
-cat(strrep("=", 80), "\n")
-
-for(outcome in names(regional_full_results)) {
-  cat("\n", outcome, ":\n")
-  summary_df <- regional_full_results[[outcome]]$summary
-  region_rows <- summary_df[grepl("^region", summary_df$term), ]
-  
-  if(nrow(region_rows) > 0) {
-    print(region_rows[, c("term", "IRR", "IRR.lower", "IRR.upper", "p.value", "stars")])
-  }
-}
-
-# === ADD REGIONAL EFFECTS TO ALL MODELS ===
-cat("\n\n", strrep("=", 80), "\n")
-cat("RUNNING REGIONAL MODELS FOR ALL INJURY AND INCIDENT TYPES\n")
-cat(strrep("=", 80), "\n\n")
-
-# Define all outcomes
-injury_outcomes <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries")
-incident_outcomes <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", "cleaned_total_hands", "cleaned_total_incidents")
-
-# Store regional results
 regional_all_results <- list()
+all_cleaned_outcomes <- c(cleaned_injury_outcomes, cleaned_incident_outcomes)
 
-# Run regional models for all outcomes
-for(outcome in c(injury_outcomes, incident_outcomes)) {
+for(outcome in all_cleaned_outcomes) {
   if(outcome %in% names(data_final)) {
-    cat("Analyzing:", outcome, "with regional effects\n")
+    original_name <- gsub("cleaned_", "", outcome)
+    cat("\nAnalyzing:", original_name, "with regional effects\n")
     
-    # Run model with full predictors + region
-    result <- pooled_nb_regression_enhanced(
-      data_final, 
-      outcome, 
-      c(preds_full, "region")
-    )
+    avg_n <- calculate_avg_n(data_final, outcome)
+    cat("  Average N across imputations:", avg_n, "\n")
+    
+    # Use special predictors for firearms injuries
+    if(original_name == "total_inj_firearms") {
+      cat("  Using binary college variable for firearms injuries model\n")
+      result <- pooled_nb_regression_enhanced(data_final, outcome, c(preds_firearms_injuries, "region"))
+    } else {
+      result <- pooled_nb_regression_enhanced(data_final, outcome, c(preds_full, "region"))
+    }
     
     if(!is.null(result)) {
-      regional_all_results[[outcome]] <- result
-      cat("  ✓ Completed. McFadden R²:", sprintf("%.3f", result$pseudo_r2$mcfadden))
-      
-      # Compare with base
-      if(outcome %in% names(all_nb_results)) {
-        base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-        improvement <- ((result$pseudo_r2$mcfadden - base_r2) / base_r2) * 100
-        cat(sprintf(" (%+.1f%% vs base)", improvement))
-      }
-      cat("\n")
+      regional_all_results[[original_name]] <- result
+      regional_all_results[[original_name]]$avg_n <- avg_n
+      cat("  ✓ Completed. McFadden R²:", sprintf("%.3f", result$pseudo_r2$mcfadden), "\n")
     } else {
       cat("  ✗ Model failed\n")
     }
   }
 }
 
-# Create enhanced comparison table
-create_enhanced_comparison <- function(base_results, regional_results) {
-  cat("\n\n", strrep("=", 100), "\n")
-  cat("COMPREHENSIVE MODEL COMPARISON: BASE vs. REGIONAL FIXED EFFECTS\n")
-  cat(strrep("=", 100), "\n")
-  
-  # Separate by type
-  injury_models <- list()
-  incident_models <- list()
-  
-  for(name in names(regional_results)) {
-    if(grepl("inj", name)) {
-      injury_models[[name]] <- regional_results[[name]]
-    } else {
-      incident_models[[name]] <- regional_results[[name]]
-    }
-  }
-  
-  # Get all predictors
-  all_predictors <- unique(unlist(lapply(regional_results, function(x) x$summary$term)))
-  all_predictors <- all_predictors[!all_predictors %in% c("(Intercept)", "regionNortheast", "regionMidwest", "regionWest")]
-  all_predictors <- sort(all_predictors)
-  
-  # Print INJURY models
-  if(length(injury_models) > 0) {
-    cat("\n--- INJURY MODELS (with Regional Effects) ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Predictor"))
-    for(outcome in names(injury_models)) {
-      short_name <- gsub("total_inj_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs
-    for(pred in all_predictors) {
-      cat(sprintf("%-35s", substr(pred, 1, 35)))
-      
-      for(outcome in names(injury_models)) {
-        if(!is.null(injury_models[[outcome]])) {
-          sum_df <- injury_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        }
-      }
-      cat("\n")
-    }
-    
-    # Add regional effects
-    cat(strrep("-", 100), "\n")
-    cat("REGIONAL EFFECTS:\n")
-    for(reg in c("regionNortheast", "regionMidwest", "regionWest")) {
-      cat(sprintf("%-35s", gsub("region", "", reg)))
-      for(outcome in names(injury_models)) {
-        sum_df <- injury_models[[outcome]]$summary
-        pred_row <- sum_df[sum_df$term == reg, ]
-        if(nrow(pred_row) > 0) {
-          irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-          cat(sprintf(" %15s", irr_str))
-        } else {
-          cat(sprintf(" %15s", "-"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit comparison
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Base McFadden R²"))
-    for(outcome in names(injury_models)) {
-      if(outcome %in% names(base_results)) {
-        cat(sprintf(" %15.3f", base_results[[outcome]]$pseudo_r2$mcfadden))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Regional McFadden R²"))
-    for(outcome in names(injury_models)) {
-      cat(sprintf(" %15.3f", injury_models[[outcome]]$pseudo_r2$mcfadden))
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Improvement"))
-    for(outcome in names(injury_models)) {
-      if(outcome %in% names(base_results)) {
-        base_r2 <- base_results[[outcome]]$pseudo_r2$mcfadden
-        reg_r2 <- injury_models[[outcome]]$pseudo_r2$mcfadden
-        improvement <- ((reg_r2 - base_r2) / base_r2) * 100
-        cat(sprintf(" %14.1f%%", improvement))
-      }
-    }
-    cat("\n")
-  }
-  
-  # Print INCIDENT models
-  if(length(incident_models) > 0) {
-    cat("\n\n--- INCIDENT MODELS (with Regional Effects) ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Predictor"))
-    for(outcome in names(incident_models)) {
-      short_name <- gsub("cleaned_total_|cleaned_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs
-    for(pred in all_predictors) {
-      cat(sprintf("%-35s", substr(pred, 1, 35)))
-      
-      for(outcome in names(incident_models)) {
-        if(!is.null(incident_models[[outcome]])) {
-          sum_df <- incident_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        }
-      }
-      cat("\n")
-    }
-    
-    # Add regional effects
-    cat(strrep("-", 100), "\n")
-    cat("REGIONAL EFFECTS:\n")
-    for(reg in c("regionNortheast", "regionMidwest", "regionWest")) {
-      cat(sprintf("%-35s", gsub("region", "", reg)))
-      for(outcome in names(incident_models)) {
-        sum_df <- incident_models[[outcome]]$summary
-        pred_row <- sum_df[sum_df$term == reg, ]
-        if(nrow(pred_row) > 0) {
-          irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-          cat(sprintf(" %15s", irr_str))
-        } else {
-          cat(sprintf(" %15s", "-"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit comparison
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Base McFadden R²"))
-    for(outcome in names(incident_models)) {
-      if(outcome %in% names(base_results)) {
-        cat(sprintf(" %15.3f", base_results[[outcome]]$pseudo_r2$mcfadden))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Regional McFadden R²"))
-    for(outcome in names(incident_models)) {
-      cat(sprintf(" %15.3f", incident_models[[outcome]]$pseudo_r2$mcfadden))
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Improvement"))
-    for(outcome in names(incident_models)) {
-      if(outcome %in% names(base_results)) {
-        base_r2 <- base_results[[outcome]]$pseudo_r2$mcfadden
-        reg_r2 <- incident_models[[outcome]]$pseudo_r2$mcfadden
-        improvement <- ((reg_r2 - base_r2) / base_r2) * 100
-        cat(sprintf(" %14.1f%%", improvement))
-      }
-    }
-    cat("\n")
-  }
-  
-  cat(strrep("-", 100), "\n")
-  cat("Significance: *** p<0.001, ** p<0.01, * p<0.05, † p<0.1\n")
-  cat("Regional effects are relative to South (reference category)\n")
-}
+#-------------------------------------------
+# CREATE APA TABLES WITH AVERAGE N
+#-------------------------------------------
 
-# Create the enhanced comparison
-if(length(regional_all_results) > 0) {
-  create_enhanced_comparison(all_nb_results, regional_all_results)
-}
-
-# Export regional results
-regional_export_df <- data.frame()
-for(outcome in names(regional_all_results)) {
-  if(!is.null(regional_all_results[[outcome]])) {
-    df <- regional_all_results[[outcome]]$summary
-    df$outcome <- outcome
-    df$model_type <- "Regional"
-    regional_export_df <- rbind(regional_export_df, df)
-  }
-}
-
-write.csv(regional_export_df, 
-          paste0(save_path, "nb_regional_all_outcomes_results.csv"), 
-          row.names = FALSE)
-
-cat("\n\n✓ Regional results exported to: nb_regional_all_outcomes_results.csv\n")
-cat("\n✓ ANALYSIS COMPLETE\n")
-
-# CREATE APA-FORMATTED TABLES FOR BOTH MODELS
-# =============================================
-
-# Function to extract and format results for a specific outcome type
-create_apa_table <- function(results_list, outcome_type = "incident") {
+create_apa_table_with_avg_n <- function(results_list, outcome_type = "incident") {
   
-  # Define which outcomes to include based on type
   if(outcome_type == "incident") {
-    outcomes <- c("cleaned_total_hands", "cleaned_total_knife", 
-                  "cleaned_total_firearms", "cleaned_total_other", 
-                  "cleaned_total_incidents")
+    outcomes <- c("total_hands", "total_knife", "total_firearms", "total_other", "total_incidents")
     col_names <- c("Hands", "Knife", "Firearms", "Other", "Total")
   } else {
-    outcomes <- c("total_inj_hands", "total_inj_knife", 
-                  "total_inj_firearms", "total_inj_other", 
-                  "total_injuries")
+    outcomes <- c("total_inj_hands", "total_inj_knife", "total_inj_firearms", 
+                  "total_inj_other", "total_injuries")
     col_names <- c("Hands", "Knife", "Firearms", "Other", "Total")
   }
   
-  # Initialize the table
   apa_table <- data.frame(Predictor = character(), stringsAsFactors = FALSE)
   
-  # Add columns for each outcome
   for(i in 1:length(outcomes)) {
     apa_table[[col_names[i]]] <- character()
   }
   
-  # Define predictor order and labels
   predictor_mapping <- list(
     "ACADEMY STRUCTURE" = NULL,
     "Basic Training Length" = "z_basic_lgth_hours",
@@ -2646,7 +732,7 @@ create_apa_table <- function(results_list, outcome_type = "incident") {
     "Environment: High Stress" = "environment_33",
     "Equipment Budget" = "z_ebudget",
     "Operational Budget" = "z_opbudget",
-    "Overseeing Agency: College" = "agency_type32",
+    "Overseeing Agency: College" = c("agency_type32", "agency_college"),  # Both possible names
     "Overseeing Agency: Other" = "agency_type33",
     "Fitness Center" = "fitness_1",
     "Obstacle Courses" = "obstacle_1",
@@ -2665,7 +751,7 @@ create_apa_table <- function(results_list, outcome_type = "incident") {
     "ACADEMY PERFORMANCE" = NULL,
     "Total Failed: Physical" = "z_fail_phys_total",
     "Total Failed: Academic" = "z_fail_academic_total",
-    "Total Failed: All Reasons" = "z_fail_total",
+    # REMOVED: "Total Failed: All Reasons" = "z_fail_total",
     "   " = NULL,
     "CONTROLS" = NULL,
     "Average Officers" = "z_mean_officers",
@@ -2678,40 +764,49 @@ create_apa_table <- function(results_list, outcome_type = "incident") {
     "West" = "regionWest"
   )
   
-  # Build the table row by row
   row_num <- 1
   for(pred_label in names(predictor_mapping)) {
     apa_table[row_num, "Predictor"] <- pred_label
     
-    pred_name <- predictor_mapping[[pred_label]]
+    pred_names <- predictor_mapping[[pred_label]]
     
-    if(!is.null(pred_name)) {
-      # This is a regular predictor, get values
+    if(!is.null(pred_names)) {
       for(i in 1:length(outcomes)) {
         outcome <- outcomes[i]
         col_name <- col_names[i]
         
         if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
           summary_df <- results_list[[outcome]]$summary
-          pred_row <- summary_df[summary_df$term == pred_name, ]
           
-          if(nrow(pred_row) > 0) {
+          # Try to find the predictor (handling both possible names for college)
+          pred_row <- NULL
+          for(pred_name in pred_names) {
+            temp_row <- summary_df[summary_df$term == pred_name, ]
+            if(nrow(temp_row) > 0) {
+              pred_row <- temp_row
+              break
+            }
+          }
+          
+          if(!is.null(pred_row) && nrow(pred_row) > 0) {
             irr <- pred_row$IRR[1]
             se <- pred_row$std.error[1]
             stars <- pred_row$stars[1]
-            
-            # Format as "IRR*stars* (SE)"
             cell_value <- sprintf("%.3f%s (%.3f)", irr, stars, se)
             apa_table[row_num, col_name] <- cell_value
           } else {
-            apa_table[row_num, col_name] <- "-"
+            # For "Other" agency category in firearms injuries, show "-"
+            if(pred_label == "Overseeing Agency: Other" && outcome == "total_inj_firearms") {
+              apa_table[row_num, col_name] <- "-"
+            } else {
+              apa_table[row_num, col_name] <- "-"
+            }
           }
         } else {
           apa_table[row_num, col_name] <- "-"
         }
       }
     } else {
-      # This is a header row, leave other columns empty
       for(col_name in col_names) {
         apa_table[row_num, col_name] <- ""
       }
@@ -2773,14 +868,18 @@ create_apa_table <- function(results_list, outcome_type = "incident") {
     }
   }
   
-  # N
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- "N"
+  # Average N
+  apa_table[nrow(apa_table) + 1, "Predictor"] <- "N (average)"
   for(i in 1:length(outcomes)) {
     outcome <- outcomes[i]
     col_name <- col_names[i]
     
     if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
-      n <- results_list[[outcome]]$n_obs
+      if(!is.null(results_list[[outcome]]$avg_n)) {
+        n <- results_list[[outcome]]$avg_n
+      } else {
+        n <- results_list[[outcome]]$n_obs
+      }
       apa_table[nrow(apa_table), col_name] <- sprintf("%d", n)
     } else {
       apa_table[nrow(apa_table), col_name] <- "-"
@@ -2790,1903 +889,80 @@ create_apa_table <- function(results_list, outcome_type = "incident") {
   return(apa_table)
 }
 
-# Create tables for both outcomes
-# Use regional_all_results if you want regional effects, or all_nb_results for base models
+#-------------------------------------------
+# GENERATE AND EXPORT TABLES
+#-------------------------------------------
 
+cat("\n=== CREATING FINAL TABLES ===\n")
+
+injury_table <- create_apa_table_with_avg_n(regional_all_results, outcome_type = "injury")
+incident_table <- create_apa_table_with_avg_n(regional_all_results, outcome_type = "incident")
+
+# Print tables
 cat("\n=====================================\n")
-cat("TABLE 1: OFFICER INJURIES\n")
+cat("TABLE 1: OFFICER INJURIES (WITH COOK'S D)\n")
 cat("=====================================\n\n")
-
-injury_table <- create_apa_table(regional_all_results, outcome_type = "injury")
 print(injury_table, row.names = FALSE, right = FALSE)
 
-# Save to original analysis folder
-write.csv(injury_table, 
-          paste0(save_path, "table_officer_injuries_apa.csv"), 
-          row.names = FALSE)
-
 cat("\n=====================================\n")
-cat("TABLE 2: OFFICER INCIDENTS\n")
+cat("TABLE 2: OFFICER INCIDENTS (WITH COOK'S D)\n")
 cat("=====================================\n\n")
-
-incident_table <- create_apa_table(regional_all_results, outcome_type = "incident")
 print(incident_table, row.names = FALSE, right = FALSE)
 
-# Save to original analysis folder
-write.csv(incident_table, 
-          paste0(save_path, "table_officer_incidents_apa.csv"), 
-          row.names = FALSE)
+# Save to both locations
+write.csv(injury_table, paste0(save_path, "table_officer_injuries_cooksd_apa.csv"), row.names = FALSE)
+write.csv(incident_table, paste0(save_path, "table_officer_incidents_cooksd_apa.csv"), row.names = FALSE)
+write.csv(injury_table, paste0(downloads_path, "table_officer_injuries_cooksd_apa.csv"), row.names = FALSE)
+write.csv(incident_table, paste0(downloads_path, "table_officer_incidents_cooksd_apa.csv"), row.names = FALSE)
 
-# =============================================
-# EXPORT TO MAC DOWNLOADS FOLDER
-# =============================================
-
-# Set Downloads folder path
-downloads_path <- "~/Downloads/"
-
-# Export injury table to Downloads
-write.csv(injury_table, 
-          paste0(downloads_path, "table_officer_injuries_apa.csv"), 
-          row.names = FALSE)
-cat("\n✓ Officer Injuries table exported to Downloads folder\n")
-
-# Export incident table to Downloads
-write.csv(incident_table, 
-          paste0(downloads_path, "table_officer_incidents_apa.csv"), 
-          row.names = FALSE)
-cat("✓ Officer Incidents table exported to Downloads folder\n")
-
-# Also export as Excel files for easier formatting
-library(openxlsx)
-
-# Create Excel workbook with both tables
+# Create Excel workbook
 wb <- createWorkbook()
-
-# Add injuries sheet
 addWorksheet(wb, "Officer Injuries")
 writeData(wb, sheet = "Officer Injuries", injury_table, rowNames = FALSE)
-
-# Add incidents sheet
 addWorksheet(wb, "Officer Incidents")
 writeData(wb, sheet = "Officer Incidents", incident_table, rowNames = FALSE)
-
-# Save Excel file to Downloads
-saveWorkbook(wb, paste0(downloads_path, "negative_binomial_results_tables.xlsx"), overwrite = TRUE)
-cat("✓ Combined Excel file exported to Downloads folder\n")
-
-# Create a prettier display function for console
-display_apa_table <- function(table_df, title) {
-  cat("\n", strrep("=", 90), "\n")
-  cat(title, "\n")
-  cat(strrep("=", 90), "\n\n")
-  
-  # Print header
-  cat(sprintf("%-35s", "Predictor"))
-  for(col in names(table_df)[-1]) {
-    cat(sprintf(" %18s", col))
-  }
-  cat("\n")
-  cat(strrep("-", 90 + 18 * (ncol(table_df) - 1)), "\n")
-  
-  # Print rows
-  for(i in 1:nrow(table_df)) {
-    pred <- table_df[i, "Predictor"]
-    
-    # Check if this is a section header
-    if(pred %in% c("ACADEMY STRUCTURE", "ACADEMY CURRICULUM", "ACADEMY PERFORMANCE", 
-                   "CONTROLS", "REGIONAL EFFECTS", "MODEL FIT")) {
-      cat("\n", pred, "\n")
-      cat(strrep("-", 90 + 18 * (ncol(table_df) - 1)), "\n")
-    } else if(pred != "") {
-      cat(sprintf("%-35s", substr(pred, 1, 35)))
-      for(j in 2:ncol(table_df)) {
-        cat(sprintf(" %18s", table_df[i, j]))
-      }
-      cat("\n")
-    }
-  }
-  
-  cat("\n")
-  cat("Note: Values are Incident Rate Ratios (IRRs) with standard errors in parentheses.\n")
-  cat("† p < 0.10, * p < 0.05, ** p < 0.01, *** p < 0.001\n")
-  cat("Reference categories: Field Training = Not Mandatory; Environment = Moderate Stress;\n")
-  cat("Overseeing Agency = State POST; Region = South.\n")
-}
-
-# Display both tables nicely
-display_apa_table(injury_table, "TABLE 1: OFFICER INJURIES")
-display_apa_table(incident_table, "TABLE 2: OFFICER INCIDENTS")
-
-# Create LaTeX version for direct inclusion in papers
-create_latex_table <- function(table_df, caption, label) {
-  cat("\n\\begin{table}[htbp]\n")
-  cat("\\centering\n")
-  cat("\\caption{", caption, "}\n")
-  cat("\\label{", label, "}\n")
-  cat("\\begin{tabular}{lccccc}\n")
-  cat("\\hline\n")
-  
-  # Header
-  cat("Predictor & Hands & Knife & Firearms & Other & Total \\\\\n")
-  cat("\\hline\n")
-  
-  # Body
-  for(i in 1:nrow(table_df)) {
-    pred <- table_df[i, "Predictor"]
-    
-    if(pred %in% c("ACADEMY STRUCTURE", "ACADEMY CURRICULUM", "ACADEMY PERFORMANCE", 
-                   "CONTROLS", "REGIONAL EFFECTS", "MODEL FIT")) {
-      cat("\\multicolumn{6}{l}{\\textbf{", pred, "}} \\\\\n")
-    } else if(pred != "") {
-      cat(pred)
-      for(j in 2:ncol(table_df)) {
-        cat(" & ", table_df[i, j])
-      }
-      cat(" \\\\\n")
-    }
-  }
-  
-  cat("\\hline\n")
-  cat("\\end{tabular}\n")
-  cat("\\end{table}\n")
-}
-
-# Generate LaTeX tables
-cat("\n\n========== LATEX VERSION ==========\n")
-create_latex_table(injury_table, 
-                   "Negative Binomial Regression Results: Officer Injuries", 
-                   "tab:injuries")
-create_latex_table(incident_table, 
-                   "Negative Binomial Regression Results: Officer Incidents", 
-                   "tab:incidents")
-
-cat("\n\n✓ EXPORT COMPLETE\n")
-cat("Files saved to Downloads folder:\n")
-cat("  - table_officer_injuries_apa.csv\n")
-cat("  - table_officer_incidents_apa.csv\n")
-cat("  - negative_binomial_results_tables.xlsx (combined Excel file)\n")
-cat("\nFiles also saved to analysis folder:\n")
-cat("  ", save_path, "\n")
+saveWorkbook(wb, paste0(downloads_path, "nb_results_cooksd_tables.xlsx"), overwrite = TRUE)
 
 #-------------------------------------------
-# 1) KEEP ONLY NEEDED VARIABLES
-#-------------------------------------------
-
-keeplist <- c(
-  # Multiple imputation variables
-  ".imp", ".id",
-  # Core variables
-  "total_firearms", "total_knife", "total_other", "total_hands",
-  "fail_phys_total", "fail_academic_total", "eth_comp_total", "fail_total",
-  "total_inj_hands", "total_inj_knife", "total_inj_firearms", "total_inj_other",
-  "total_injuries", "total_incidents",
-  "instructor_ratio",
-  "basic_lgth_hours", "ft_sworn", "ft_civ", "ebudget", "opbudget", "mean_officers",
-  "total_studyhours", "total_violent", "field_man", "environment_3", "agency_type3", "min_ed_bin",
-  "fitness_1", "obstacle_1", "firerange", "scenario_1", "refresher",
-  "htraf", "emv", "pat", "judo", "def_tac", "fire_skill", "nonl", "acsh",
-  "medi", "prob_solv", "lang", "comm", "ethic", "stress", "prof", "hate", "cult",
-  "crim", "jjl", "traf_law", "domv", "gang", "victim", "com_part",
-  "total_cleared_murder", "total_cleared_robbery", "total_cleared_assault", "total_cleared_burglary",
-  "total_clearviolent", "violentclearance_rate",
-  "statecode"  # ADDED STATECODE HERE
-)
-
-# Keep only variables that exist in the dataset
-keeplist <- keeplist[keeplist %in% names(data_final)]
-data_final <- data_final[, keeplist]
-
-print("Variables kept:")
-print(names(data_final))
-
-# Verify statecode is still there
-if("statecode" %in% names(data_final)) {
-  cat("\n✓ statecode successfully retained in dataset\n")
-} else {
-  cat("\n✗ statecode was not retained - it may not exist in the original data\n")
-}
-
-#-------------------------------------------
-# 2) Z-score standardization
-#-------------------------------------------
-
-# Variables to standardize
-standardize_vars <- c("basic_lgth_hours", "ft_sworn", "ft_civ", "ebudget", "opbudget", 
-                     "mean_officers", "total_studyhours", "total_violent", "total_clearviolent",
-                     "fail_phys_total", "fail_academic_total", "fail_total")
-
-# Function to standardize within each imputation
-standardize_imputed <- function(data, vars) {
-  if(".imp" %in% names(data)) {
-    imp_nums <- unique(data$.imp)
-  } else {
-    imp_nums <- 0
-  }
-  
-  for(var in vars) {
-    if(var %in% names(data)) {
-      z_var_name <- paste0("z_", var)
-      data[[z_var_name]] <- NA
-      
-      for(imp in imp_nums) {
-        if(".imp" %in% names(data)) {
-          mask <- data$.imp == imp
-        } else {
-          mask <- rep(TRUE, nrow(data))
-        }
-        
-        values <- data[[var]][mask]
-        if(sum(!is.na(values)) > 1) {
-          data[[z_var_name]][mask] <- scale(values)[,1]
-        }
-      }
-    }
-  }
-  return(data)
-}
-
-# Apply standardization
-data_final <- standardize_imputed(data_final, standardize_vars)
-
-#-------------------------------------------
-# Convert categorical variables to factors
-#-------------------------------------------
-
-if("field_man" %in% names(data_final)) {
-  data_final$field_man <- as.factor(data_final$field_man)
-  if("3" %in% levels(data_final$field_man)) {
-    data_final$field_man <- relevel(data_final$field_man, ref = "3")
-  }
-}
-
-if("environment_3" %in% names(data_final)) {
-  data_final$environment_3 <- as.factor(data_final$environment_3)
-  if("2" %in% levels(data_final$environment_3)) {
-    data_final$environment_3 <- relevel(data_final$environment_3, ref = "2")
-  }
-}
-
-if("agency_type3" %in% names(data_final)) {
-  data_final$agency_type3 <- as.factor(data_final$agency_type3)
-}
-
-#-------------------------------------------
-# 3) Factor score generation
-#-------------------------------------------
-
-# Load required libraries for CFA
-library(lavaan)
-library(semTools)
-
-# Function to perform CFA within each imputation
-perform_cfa_analysis <- function(data, vars, factor_name) {
-  if(".imp" %in% names(data)) {
-    imp_nums <- unique(data$.imp)
-  } else {
-    imp_nums <- 0
-  }
-  
-  data[[factor_name]] <- NA
-  all_fit_indices <- list()
-  
-  for(imp in imp_nums) {
-    if(".imp" %in% names(data)) {
-      mask <- data$.imp == imp
-      subset_data <- data[mask, vars, drop = FALSE]
-    } else {
-      subset_data <- data[, vars, drop = FALSE]
-      mask <- rep(TRUE, nrow(data))
-    }
-    
-    complete_cases <- complete.cases(subset_data)
-    if(sum(complete_cases) > length(vars)) {
-      cfa_data <- subset_data[complete_cases, , drop = FALSE]
-      
-      # Define CFA model
-      items <- paste(vars, collapse = " + ")
-      cfa_model <- paste0(factor_name, " =~ ", items)
-      
-      tryCatch({
-        # Fit CFA model
-        cfa_fit <- cfa(cfa_model, 
-                      data = cfa_data, 
-                      std.lv = TRUE,
-                      estimator = "MLR")
-        
-        # Extract fit indices
-        fit_indices <- fitMeasures(cfa_fit, 
-                                  c("chisq", "df", "pvalue",
-                                    "cfi", "tli", "rmsea",
-                                    "rmsea.ci.lower", "rmsea.ci.upper",
-                                    "srmr"))
-        
-        all_fit_indices[[length(all_fit_indices) + 1]] <- fit_indices
-        
-        # Extract factor scores
-        factor_scores <- rep(NA, sum(mask))
-        factor_scores[complete_cases] <- lavPredict(cfa_fit, method = "regression")[,1]
-        data[[factor_name]][mask] <- factor_scores
-        
-      }, error = function(e) {
-        # Fallback to EFA if CFA fails
-        warning(paste("CFA failed for", factor_name, "in imputation", imp, 
-                     "- using EFA:", e$message))
-        
-        tryCatch({
-          fa_result <- fa(cfa_data, nfactors = 1, rotate = "none", scores = "regression")
-          factor_scores <- rep(NA, sum(mask))
-          factor_scores[complete_cases] <- fa_result$scores[,1]
-          data[[factor_name]][mask] <- factor_scores
-        }, error = function(e2) {
-          warning(paste("Both CFA and EFA failed for", factor_name, "in imputation", imp))
-        })
-      })
-    }
-  }
-  
-  # Report pooled fit indices
-  if(length(all_fit_indices) > 0) {
-    if(length(all_fit_indices) > 1) {
-      fit_matrix <- do.call(rbind, all_fit_indices)
-      pooled_fits <- colMeans(fit_matrix, na.rm = TRUE)
-    } else {
-      pooled_fits <- all_fit_indices[[1]]
-    }
-    
-    cat("\n", factor_name, "- Pooled Model Fit:\n")
-    cat(sprintf("  χ²(%d) = %.2f, p = %.3f\n", 
-               pooled_fits["df"], 
-               pooled_fits["chisq"], 
-               pooled_fits["pvalue"]))
-    cat(sprintf("  CFI = %.3f, TLI = %.3f\n", 
-               pooled_fits["cfi"], 
-               pooled_fits["tli"]))
-    cat(sprintf("  RMSEA = %.3f [%.3f, %.3f]\n", 
-               pooled_fits["rmsea"], 
-               pooled_fits["rmsea.ci.lower"], 
-               pooled_fits["rmsea.ci.upper"]))
-    cat(sprintf("  SRMR = %.3f\n", pooled_fits["srmr"]))
-  }
-  
-  return(data)
-}
-
-# Create factors with REVISED variables based on your table
-cat("\n========== CONFIRMATORY FACTOR ANALYSIS ==========\n")
-
-# Force-based Instruction (using only 4 variables as per your revised model)
-force_vars <- c("emv", "def_tac", "fire_skill", "nonl")
-force_vars <- force_vars[force_vars %in% names(data_final)]
-if(length(force_vars) > 0) {
-  cat("\nForce-Based Instruction Factor\n")
-  cat("Variables:", paste(force_vars, collapse=", "), "\n")
-  data_final <- perform_cfa_analysis(data_final, force_vars, "force_based")
-}
-
-# Contemporary Policing Studies (using only 4 variables as per your revised model)
-modern_vars <- c("comm", "ethic", "prof", "cult")
-modern_vars <- modern_vars[modern_vars %in% names(data_final)]
-if(length(modern_vars) > 0) {
-  cat("\nContemporary Policing Studies Factor\n")
-  cat("Variables:", paste(modern_vars, collapse=", "), "\n")
-  data_final <- perform_cfa_analysis(data_final, modern_vars, "contemporary_policing")
-  
-  # Create composite score as alternative due to poor fit
-  cat("Note: Creating composite score as alternative due to high RMSEA\n")
-  temp_data <- data_final[, modern_vars]
-  data_final$contemporary_policing_composite <- rowMeans(temp_data, na.rm = TRUE)
-}
-
-# Special Topics Study (all 4 variables)
-special_vars <- c("jjl", "traf_law", "domv", "victim")
-special_vars <- special_vars[special_vars %in% names(data_final)]
-if(length(special_vars) > 0) {
-  cat("\nSpecial Topics Study Factor\n")
-  cat("Variables:", paste(special_vars, collapse=", "), "\n")
-  data_final <- perform_cfa_analysis(data_final, special_vars, "special_study")
-}
-
-cat("\n========== FIT INDICES SUMMARY ==========\n")
-cat("Recommended cutoffs:\n")
-cat("  CFI ≥ 0.95 (good), ≥ 0.90 (acceptable)\n")
-cat("  TLI ≥ 0.95 (good), ≥ 0.90 (acceptable)\n")
-cat("  RMSEA ≤ 0.06 (good), ≤ 0.08 (acceptable)\n")
-cat("  SRMR ≤ 0.08 (good)\n")
-cat("\nNote: Contemporary Policing Studies shows poor fit (high RMSEA).\n")
-cat("Consider using contemporary_policing_composite in analyses.\n")
-
-#-------------------------------------------
-# 4) Define comprehensive predictor list - FIXED TO USE CORRECT NAME
-#-------------------------------------------
-
-preds_full <- c(
-  "z_basic_lgth_hours",
-  "field_man",
-  "environment_3",
-  "z_ebudget", 
-  "z_opbudget",
-  "agency_type3",
-  "fitness_1", 
-  "obstacle_1", 
-  "firerange", 
-  "scenario_1", 
-  "refresher",
-  "force_based", 
-  "contemporary_policing_composite",  # CHANGED from "modern_study" and using composite due to poor fit
-  "special_study",
-  "z_ft_sworn", 
-  "z_ft_civ",
-  "min_ed_bin", 
-  "z_mean_officers", 
-  "z_total_violent",
-  "violentclearance_rate",
-  "z_fail_phys_total",
-  "z_fail_academic_total", 
-  "z_fail_total"
-)
-
-# Remove any predictors that don't exist
-preds_full <- preds_full[preds_full %in% names(data_final)]
-
-print("Final predictors to be used:")
-print(preds_full)
-
-#-------------------------------------------
-# 5) Cook's D removal of high-influence cases
-#-------------------------------------------
-
-dvs <- c("total_firearms", "total_knife", "total_other", "total_hands")
-preds_cooksd <- c("z_basic_lgth_hours", "z_ft_sworn", "z_ft_civ", "z_ebudget", "z_opbudget", "z_mean_officers")
-
-dvs <- dvs[dvs %in% names(data_final)]
-preds_cooksd <- preds_cooksd[preds_cooksd %in% names(data_final)]
-
-# Cook's D cleaning function
-cook_d_cleaning <- function(data, outcomes, predictors) {
-  if(".imp" %in% names(data)) {
-    imp_nums <- unique(data$.imp)
-    imp_nums <- imp_nums[imp_nums > 0]
-  } else {
-    imp_nums <- 1
-    data$.imp <- 1
-  }
-  
-  for(dv in outcomes) {
-    if(dv %in% names(data)) {
-      print(paste(">>> Processing Cook's D for", dv))
-      
-      data[[paste0("cooksd_", dv)]] <- NA
-      data[[paste0("cleaned_", dv)]] <- data[[dv]]
-      
-      for(m in imp_nums) {
-        mask <- data$.imp == m
-        subset_data <- data[mask, c(dv, predictors), drop = FALSE]
-        complete_cases <- complete.cases(subset_data)
-        
-        if(sum(complete_cases) > length(predictors) + 1) {
-          N <- sum(complete_cases)
-          cutoff <- 4 / N
-          
-          tryCatch({
-            formula_str <- paste(dv, "~", paste(predictors, collapse = " + "))
-            model <- lm(as.formula(formula_str), data = subset_data[complete_cases, ])
-            cooksd_values <- cooks.distance(model)
-            
-            cooksd_full <- rep(NA, sum(mask))
-            cooksd_full[complete_cases] <- cooksd_values
-            data[[paste0("cooksd_", dv)]][mask] <- cooksd_full
-            
-            high_influence <- cooksd_full > cutoff & !is.na(cooksd_full)
-            data[[paste0("cleaned_", dv)]][mask][high_influence] <- NA
-            
-            print(paste("  Imputation", m, ": Removed", sum(high_influence, na.rm = TRUE), 
-                       "high-influence cases out of", N, "(cutoff =", round(cutoff, 6), ")"))
-            
-          }, error = function(e) {
-            warning(paste("Cook's D calculation failed for", dv, "in imputation", m, ":", e$message))
-          })
-        }
-      }
-    }
-  }
-  
-  return(data)
-}
-
-# Apply Cook's D cleaning
-data_final <- cook_d_cleaning(data_final, dvs, preds_cooksd)
-
-# Create cleaned total incidents
-data_final$cleaned_total_incidents <- rowSums(data_final[, paste0("cleaned_", dvs)], na.rm = TRUE)
-
-# Define cleaned outcomes
-cleaned_outcomes <- paste0("cleaned_", dvs)
-cleaned_outcomes <- cleaned_outcomes[cleaned_outcomes %in% names(data_final)]
-
-# COMPREHENSIVE NEGATIVE BINOMIAL ANALYSIS
-# =========================================
-# All injury and incident types plus totals
-
-#-------------------------------------------
-# SETUP AND FUNCTIONS
-#-------------------------------------------
-
-# Define all outcomes to analyze
-injury_outcomes <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries")
-incident_outcomes <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", "cleaned_total_hands", "cleaned_total_incidents")
-
-# Store all results
-all_nb_results <- list()
-
-#-------------------------------------------
-# RUN ALL MODELS
-#-------------------------------------------
-
-cat("\n", strrep("=", 80), "\n")
-cat("RUNNING COMPREHENSIVE NEGATIVE BINOMIAL MODELS\n")
-cat("Analyzing all injury types, incident types, and totals\n")
-cat(strrep("=", 80), "\n")
-
-# 1. Run models for all injury outcomes
-cat("\n>>> INJURY MODELS <<<\n")
-for(outcome in injury_outcomes) {
-  if(outcome %in% names(data_final)) {
-    cat("\nAnalyzing:", outcome, "\n")
-    
-    # Show distribution
-    tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-    cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-        "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-    
-    # Run model
-    nb_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_full)
-    
-    if(!is.null(nb_result)) {
-      all_nb_results[[outcome]] <- nb_result
-      cat("  ✓ Model completed successfully\n")
-    } else {
-      cat("  ✗ Model failed\n")
-    }
-  }
-}
-
-# 2. Run models for all incident outcomes
-cat("\n>>> INCIDENT MODELS <<<\n")
-for(outcome in incident_outcomes) {
-  if(outcome %in% names(data_final)) {
-    cat("\nAnalyzing:", outcome, "\n")
-    
-    # Show distribution
-    tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-    cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-        "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-    
-    # Run model
-    nb_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_full)
-    
-    if(!is.null(nb_result)) {
-      all_nb_results[[outcome]] <- nb_result
-      cat("  ✓ Model completed successfully\n")
-    } else {
-      cat("  ✗ Model failed\n")
-    }
-  }
-}
-
-#-------------------------------------------
-# CREATE COMPREHENSIVE COMPARISON TABLE WITH MCFADDEN'S R²
-#-------------------------------------------
-
-create_comprehensive_comparison <- function(results_list) {
-  cat("\n\n", strrep("=", 100), "\n")
-  cat("COMPREHENSIVE MODEL COMPARISON: ALL INJURY AND INCIDENT TYPES\n")
-  cat(strrep("=", 100), "\n")
-  
-  # Separate injury and incident models
-  injury_models <- results_list[names(results_list) %in% c("total_inj_firearms", "total_inj_knife", 
-                                                           "total_inj_other", "total_inj_hands", 
-                                                           "total_injuries")]
-  
-  incident_models <- results_list[names(results_list) %in% c("cleaned_total_firearms", "cleaned_total_knife", 
-                                                             "cleaned_total_other", "cleaned_total_hands", 
-                                                             "cleaned_total_incidents", "cleaned_total_injuries")]
-  
-  # Get all unique predictors
-  all_predictors <- c()
-  for(model_name in names(results_list)) {
-    if(!is.null(results_list[[model_name]])) {
-      all_predictors <- unique(c(all_predictors, results_list[[model_name]]$summary$term))
-    }
-  }
-  all_predictors <- all_predictors[all_predictors != "(Intercept)"]
-  all_predictors <- sort(all_predictors)
-  
-  # Print header for injuries
-  if(length(injury_models) > 0) {
-    cat("\n--- INJURY MODELS ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "Predictor"))
-    for(outcome in names(injury_models)) {
-      short_name <- gsub("total_inj_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs for injury models
-    for(pred in all_predictors) {
-      cat(sprintf("%-30s", substr(pred, 1, 30)))
-      
-      for(outcome in names(injury_models)) {
-        if(!is.null(injury_models[[outcome]])) {
-          sum_df <- injury_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        } else {
-          cat(sprintf(" %15s", "NA"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit for injuries - INCLUDING MCFADDEN'S R²
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "McFadden R²"))
-    for(outcome in names(injury_models)) {
-      if(!is.null(injury_models[[outcome]])) {
-        cat(sprintf(" %15.3f", injury_models[[outcome]]$pseudo_r2$mcfadden))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "Nagelkerke R²"))
-    for(outcome in names(injury_models)) {
-      if(!is.null(injury_models[[outcome]])) {
-        cat(sprintf(" %15.3f", injury_models[[outcome]]$pseudo_r2$nagelkerke))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "N"))
-    for(outcome in names(injury_models)) {
-      if(!is.null(injury_models[[outcome]])) {
-        cat(sprintf(" %15.0f", injury_models[[outcome]]$n_obs))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-  }
-  
-  # Print header for incidents
-  if(length(incident_models) > 0) {
-    cat("\n\n--- INCIDENT MODELS ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "Predictor"))
-    for(outcome in names(incident_models)) {
-      short_name <- gsub("cleaned_total_|cleaned_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs for incident models
-    for(pred in all_predictors) {
-      cat(sprintf("%-30s", substr(pred, 1, 30)))
-      
-      for(outcome in names(incident_models)) {
-        if(!is.null(incident_models[[outcome]])) {
-          sum_df <- incident_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        } else {
-          cat(sprintf(" %15s", "NA"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit for incidents - INCLUDING MCFADDEN'S R²
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-30s", "McFadden R²"))
-    for(outcome in names(incident_models)) {
-      if(!is.null(incident_models[[outcome]])) {
-        cat(sprintf(" %15.3f", incident_models[[outcome]]$pseudo_r2$mcfadden))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "Nagelkerke R²"))
-    for(outcome in names(incident_models)) {
-      if(!is.null(incident_models[[outcome]])) {
-        cat(sprintf(" %15.3f", incident_models[[outcome]]$pseudo_r2$nagelkerke))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-30s", "N"))
-    for(outcome in names(incident_models)) {
-      if(!is.null(incident_models[[outcome]])) {
-        cat(sprintf(" %15.0f", incident_models[[outcome]]$n_obs))
-      } else {
-        cat(sprintf(" %15s", "NA"))
-      }
-    }
-    cat("\n")
-  }
-  
-  cat(strrep("-", 100), "\n")
-  cat("Significance: *** p<0.001, ** p<0.01, * p<0.05, † p<0.1\n")
-}
-
-# Create the comprehensive comparison
-if(length(all_nb_results) > 0) {
-  create_comprehensive_comparison(all_nb_results)
-}
-
-#-------------------------------------------
-# VIF FOR POOLED MODEL
+# SUMMARY OF SAMPLE SIZES
 #-------------------------------------------
 
 cat("\n\n", strrep("=", 80), "\n")
-cat("VARIANCE INFLATION FACTORS (VIF) - POOLED MODEL\n")
-cat(strrep("=", 80), "\n")
-
-# Calculate VIF using total incidents as outcome
-if("cleaned_total_incidents" %in% names(data_final)) {
-  vif_pooled <- calculate_vif_imputed(data_final, preds_full, "cleaned_total_incidents")
-  
-  if(!is.null(vif_pooled)) {
-    cat("\nVIF Summary (averaged across all imputations):\n")
-    cat(strrep("-", 60), "\n")
-    
-    # Show all VIF values sorted
-    vif_pooled <- vif_pooled[order(vif_pooled$Avg_VIF, decreasing = TRUE), ]
-    
-    for(i in 1:nrow(vif_pooled)) {
-      cat(sprintf("%-30s: %6.3f", vif_pooled$Variable[i], vif_pooled$Avg_VIF[i]))
-      if(vif_pooled$Avg_VIF[i] > 10) {
-        cat(" ***")
-      } else if(vif_pooled$Avg_VIF[i] > 5) {
-        cat(" **")
-      }
-      cat("\n")
-    }
-    
-    cat(strrep("-", 60), "\n")
-    cat("Note: *** = VIF > 10 (severe), ** = VIF > 5 (moderate)\n")
-    
-    # Quick summary
-    cat("\nMulticollinearity Summary:\n")
-    cat("- Highest VIF:", round(max(vif_pooled$Avg_VIF), 3), 
-        "(", vif_pooled$Variable[1], ")\n")
-    cat("- Variables with VIF > 10:", sum(vif_pooled$Avg_VIF > 10), "\n")
-    cat("- Variables with VIF > 5:", sum(vif_pooled$Avg_VIF > 5), "\n")
-  }
-}
-
-#-------------------------------------------
-# EXPORT ALL RESULTS
-#-------------------------------------------
-
-# Export comprehensive results
-if(length(all_nb_results) > 0) {
-  all_results_df <- data.frame()
-  
-  for(outcome in names(all_nb_results)) {
-    if(!is.null(all_nb_results[[outcome]])) {
-      df <- all_nb_results[[outcome]]$summary
-      df$outcome <- outcome
-      df$outcome_type <- ifelse(grepl("inj", outcome), "Injury", "Incident")
-      df$weapon_type <- case_when(
-        grepl("firearms", outcome) ~ "Firearms",
-        grepl("knife", outcome) ~ "Knife",
-        grepl("other", outcome) ~ "Other",
-        grepl("hands", outcome) ~ "Hands",
-        grepl("injuries", outcome) ~ "Total",
-        grepl("incidents", outcome) ~ "Total",
-        TRUE ~ "Unknown"
-      )
-      df$pseudo_r2_nagelkerke <- all_nb_results[[outcome]]$pseudo_r2$nagelkerke
-      df$pseudo_r2_mcfadden <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-      df$pseudo_r2_cox_snell <- all_nb_results[[outcome]]$pseudo_r2$cox_snell
-      df$theta <- all_nb_results[[outcome]]$avg_theta
-      df$aic <- all_nb_results[[outcome]]$avg_aic
-      df$bic <- all_nb_results[[outcome]]$avg_bic
-      df$n_obs <- all_nb_results[[outcome]]$n_obs
-      
-      all_results_df <- rbind(all_results_df, df)
-    }
-  }
-  
-  write.csv(all_results_df, 
-            paste0(save_path, "nb_comprehensive_all_outcomes_results.csv"), 
-            row.names = FALSE)
-  
-  cat("\n\n✓ Comprehensive results exported to: nb_comprehensive_all_outcomes_results.csv\n")
-}
-
-#-------------------------------------------
-# CREATE SUMMARY STATISTICS TABLE
-#-------------------------------------------
-
-cat("\n\n", strrep("=", 80), "\n")
-cat("SUMMARY STATISTICS FOR ALL OUTCOMES\n")
-cat(strrep("=", 80), "\n")
-
-# Create summary stats
-summary_stats <- data.frame(
-  Outcome = character(),
-  Type = character(),
-  Mean = numeric(),
-  SD = numeric(),
-  Min = numeric(),
-  Max = numeric(),
-  Zeros = numeric(),
-  N = numeric()
-)
-
-# Calculate for all outcomes
-all_outcomes <- c(injury_outcomes, incident_outcomes)
-for(outcome in all_outcomes) {
-  if(outcome %in% names(data_final)) {
-    # Use first imputation for summary stats
-    outcome_data <- data_final[[outcome]][data_final$.imp == 1]
-    
-    summary_stats <- rbind(summary_stats, data.frame(
-      Outcome = outcome,
-      Type = ifelse(grepl("inj", outcome), "Injury", "Incident"),
-      Mean = round(mean(outcome_data, na.rm = TRUE), 2),
-      SD = round(sd(outcome_data, na.rm = TRUE), 2),
-      Min = min(outcome_data, na.rm = TRUE),
-      Max = max(outcome_data, na.rm = TRUE),
-      Zeros = sum(outcome_data == 0, na.rm = TRUE),
-      N = sum(!is.na(outcome_data))
-    ))
-  }
-}
-
-print(summary_stats)
-
-# Save summary statistics
-write.csv(summary_stats, 
-          paste0(save_path, "nb_outcome_summary_statistics.csv"), 
-          row.names = FALSE)
-
-#-------------------------------------------
-# CREATE VISUALIZATION OF KEY PREDICTORS
-#-------------------------------------------
-
-# Function to create a heatmap-style visualization
-create_irr_heatmap <- function(results_list, top_n = 15) {
-  # Extract significant predictors across all models
-  sig_data <- data.frame()
-  
-  for(outcome in names(results_list)) {
-    if(!is.null(results_list[[outcome]])) {
-      df <- results_list[[outcome]]$summary
-      df <- df[df$p.value < 0.05 & df$term != "(Intercept)", ]
-      if(nrow(df) > 0) {
-        df$outcome <- outcome
-        df$outcome_clean <- gsub("cleaned_total_|total_inj_|total_", "", outcome)
-        df$log_irr <- log(df$IRR)
-        sig_data <- rbind(sig_data, df[, c("term", "outcome_clean", "IRR", "log_irr", "p.value")])
-      }
-    }
-  }
-  
-  if(nrow(sig_data) > 0) {
-    # Get top predictors by average absolute effect
-    top_preds <- sig_data %>%
-      group_by(term) %>%
-      summarise(avg_abs_effect = mean(abs(log_irr))) %>%
-      arrange(desc(avg_abs_effect)) %>%
-      head(top_n) %>%
-      pull(term)
-    
-    # Filter to top predictors
-    plot_data <- sig_data[sig_data$term %in% top_preds, ]
-    
-    # Clean names
-    plot_data$term_clean <- gsub("z_", "", plot_data$term)
-    plot_data$term_clean <- gsub("_", " ", plot_data$term_clean)
-    plot_data$term_clean <- gsub("agency type32", "Agency: College", plot_data$term_clean)
-    plot_data$term_clean <- gsub("agency type33", "Agency: Other", plot_data$term_clean)
-    plot_data$term_clean <- gsub("total clearviolent", "Violent Crimes Cleared", plot_data$term_clean)
-    plot_data$term_clean <- gsub("mean officers", "Mean Officers", plot_data$term_clean)
-    plot_data$term_clean <- gsub("ft sworn", "FT Sworn Instructors", plot_data$term_clean)
-    plot_data$term_clean <- gsub("contemporary policing composite", "Contemporary Policing", plot_data$term_clean)
-    
-    # Create plot
-    p <- ggplot(plot_data, aes(x = outcome_clean, y = term_clean, fill = log_irr)) +
-      geom_tile(color = "white", size = 0.5) +
-      geom_text(aes(label = sprintf("%.2f", IRR)), size = 3) +
-      scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
-                          midpoint = 0, limits = c(-1.5, 1.5),
-                          name = "Log(IRR)") +
-      labs(title = "Significant Predictors Across All Models",
-           subtitle = "Numbers show Incident Rate Ratios (p < 0.05)",
-           x = "Outcome Type",
-           y = NULL) +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1),
-            plot.title = element_text(hjust = 0.5, face = "bold"),
-            plot.subtitle = element_text(hjust = 0.5))
-    
-    ggsave(paste0(save_path, "irr_heatmap_all_models.png"), 
-           p, width = 12, height = 8, dpi = 300)
-    
-    cat("\n✓ IRR heatmap saved: irr_heatmap_all_models.png\n")
-  }
-}
-
-# Create the visualization
-if(length(all_nb_results) > 0) {
-  create_irr_heatmap(all_nb_results)
-}
-
-# =================================================
-# STATE EFFECTS ANALYSIS
-# =================================================
-
-cat("\n\n", strrep("=", 80), "\n")
-cat("STATE EFFECTS ANALYSIS\n")
-cat(strrep("=", 80), "\n")
-
-# First check if statecode exists in the data
-if("statecode" %in% names(data_final)) {
-  
-  # Convert statecode to factor if it isn't already
-  data_final$statecode <- as.factor(data_final$statecode)
-  
-  # Check number of states
-  n_states <- length(unique(data_final$statecode[!is.na(data_final$statecode)]))
-  cat("\nNumber of states in data:", n_states, "\n")
-  
-  # Create predictor list with state effects
-  preds_with_state <- c(preds_full, "statecode")
-  
-  # Store state effects results
-  state_effects_results <- list()
-  
-  cat("\n>>> RUNNING MODELS WITH STATE FIXED EFFECTS <<<\n")
-  cat("Note: This may take longer due to additional parameters\n\n")
-  
-  # Run models for key outcomes only (to save time)
-  key_outcomes <- c("total_injuries", "cleaned_total_incidents", 
-                    "total_inj_firearms", "cleaned_total_firearms")
-  
-  for(outcome in key_outcomes) {
-    if(outcome %in% names(data_final)) {
-      cat("\nAnalyzing with state effects:", outcome, "\n")
-      
-      # Show distribution
-      tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-      cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-          "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-      
-      # Run model with state effects
-      nb_state_result <- pooled_nb_regression_enhanced(data_final, outcome, preds_with_state)
-      
-      if(!is.null(nb_state_result)) {
-        state_effects_results[[outcome]] <- nb_state_result
-        cat("  ✓ State effects model completed successfully\n")
-        
-        # Compare with base model
-        if(outcome %in% names(all_nb_results)) {
-          base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-          state_r2 <- nb_state_result$pseudo_r2$mcfadden
-          r2_improvement <- state_r2 - base_r2
-          
-          cat("  McFadden R² comparison:\n")
-          cat("    Base model: ", sprintf("%.4f", base_r2), "\n")
-          cat("    State model:", sprintf("%.4f", state_r2), "\n")
-          cat("    Improvement:", sprintf("%.4f", r2_improvement), 
-              "(", sprintf("%.1f%%", (r2_improvement/base_r2)*100), ")\n")
-        }
-      } else {
-        cat("  ✗ State effects model failed\n")
-      }
-    }
-  }
-  
-  # Create comparison table
-  if(length(state_effects_results) > 0) {
-    cat("\n\n", strrep("=", 80), "\n")
-    cat("MODEL COMPARISON: BASE vs. STATE FIXED EFFECTS\n")
-    cat(strrep("=", 80), "\n")
-    
-    comparison_df <- data.frame(
-      Outcome = character(),
-      Base_McFadden = numeric(),
-      State_McFadden = numeric(),
-      Improvement = numeric(),
-      Base_Nagelkerke = numeric(),
-      State_Nagelkerke = numeric(),
-      Base_AIC = numeric(),
-      State_AIC = numeric(),
-      stringsAsFactors = FALSE
-    )
-    
-    for(outcome in names(state_effects_results)) {
-      if(outcome %in% names(all_nb_results)) {
-        base_model <- all_nb_results[[outcome]]
-        state_model <- state_effects_results[[outcome]]
-        
-        comparison_df <- rbind(comparison_df, data.frame(
-          Outcome = outcome,
-          Base_McFadden = base_model$pseudo_r2$mcfadden,
-          State_McFadden = state_model$pseudo_r2$mcfadden,
-          Improvement = state_model$pseudo_r2$mcfadden - base_model$pseudo_r2$mcfadden,
-          Base_Nagelkerke = base_model$pseudo_r2$nagelkerke,
-          State_Nagelkerke = state_model$pseudo_r2$nagelkerke,
-          Base_AIC = base_model$avg_aic,
-          State_AIC = state_model$avg_aic,
-          stringsAsFactors = FALSE
-        ))
-      }
-    }
-    
-    print(comparison_df)
-    
-    # Save comparison
-    write.csv(comparison_df, 
-              paste0(save_path, "state_effects_comparison.csv"), 
-              row.names = FALSE)
-    
-    # Extract key predictors comparison - FIXED KEY PREDICTORS
-    cat("\n\n", strrep("=", 80), "\n")
-    cat("KEY PREDICTORS: BASE vs. STATE MODELS\n")
-    cat(strrep("=", 80), "\n")
-    cat("Showing how IRRs change when controlling for state effects\n\n")
-    
-    # Focus on a few key predictors - UPDATED WITH CORRECT NAME
-    key_preds <- c("z_basic_lgth_hours", "force_based", "contemporary_policing_composite", 
-                   "z_fail_total", "violentclearance_rate")
-    
-    for(pred in key_preds) {
-      cat("\n", pred, ":\n")
-      cat(sprintf("%-25s %10s %10s %10s\n", "Outcome", "Base IRR", "State IRR", "Change"))
-      cat(strrep("-", 60), "\n")
-      
-      for(outcome in names(state_effects_results)) {
-        if(outcome %in% names(all_nb_results)) {
-          base_sum <- all_nb_results[[outcome]]$summary
-          state_sum <- state_effects_results[[outcome]]$summary
-          
-          base_row <- base_sum[base_sum$term == pred, ]
-          state_row <- state_sum[state_sum$term == pred, ]
-          
-          if(nrow(base_row) > 0 && nrow(state_row) > 0) {
-            cat(sprintf("%-25s %10.3f%s %10.3f%s %10.1f%%\n",
-                       gsub("cleaned_total_|total_", "", outcome),
-                       base_row$IRR[1], base_row$stars[1],
-                       state_row$IRR[1], state_row$stars[1],
-                       ((state_row$IRR[1] - base_row$IRR[1])/base_row$IRR[1])*100))
-          }
-        }
-      }
-    }
-    
-    # Save full state effects results
-    state_results_df <- data.frame()
-    
-    for(outcome in names(state_effects_results)) {
-      if(!is.null(state_effects_results[[outcome]])) {
-        df <- state_effects_results[[outcome]]$summary
-        df$outcome <- outcome
-        df <- df[!grepl("statecode", df$term), ]  # Remove individual state coefficients
-        state_results_df <- rbind(state_results_df, df)
-      }
-    }
-    
-    write.csv(state_results_df, 
-              paste0(save_path, "nb_state_effects_results.csv"), 
-              row.names = FALSE)
-    
-    cat("\n\n✓ State effects analysis complete\n")
-    cat("✓ Files created:\n")
-    cat("  - state_effects_comparison.csv\n")
-    cat("  - nb_state_effects_results.csv\n")
-  }
-  
-} else {
-  cat("\nWARNING: 'statecode' variable not found in dataset\n")
-  cat("Cannot perform state effects analysis\n")
-}
-
-# Update the final summary message
-cat("\n\n", strrep("=", 80), "\n")
-cat("COMPREHENSIVE ANALYSIS COMPLETE\n")
-cat(strrep("=", 80), "\n")
-cat("\nFiles created:\n")
-cat("- nb_comprehensive_all_outcomes_results.csv (includes McFadden R²)\n")
-cat("- nb_outcome_summary_statistics.csv\n")
-cat("- irr_heatmap_all_models.png\n")
-if("statecode" %in% names(data_final)) {
-  cat("- state_effects_comparison.csv\n")
-  cat("- nb_state_effects_results.csv\n")
-}
-
-# Create regions based on actual state abbreviations
-# Using Census Bureau regional classifications
-
-# Define the regions
-northeast <- c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA")
-midwest <- c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD")
-south <- c("DE", "FL", "GA", "MD", "NC", "SC", "VA", "WV", "DC", "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX")
-west <- c("AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", "CA", "HI", "OR", "WA")
-
-# Create region variable
-data_final$region <- case_when(
-  data_final$statecode %in% northeast ~ "Northeast",
-  data_final$statecode %in% midwest ~ "Midwest",
-  data_final$statecode %in% south ~ "South",
-  data_final$statecode %in% west ~ "West",
-  TRUE ~ "Unknown"
-)
-
-# Convert to factor with South as reference (largest region)
-data_final$region <- factor(data_final$region, levels = c("South", "Northeast", "Midwest", "West"))
-
-# Check the regional distribution
-cat("\nRegional distribution:\n")
-print(table(data_final$region[data_final$.imp == 1]))
-
-# Now run regional models
-cat("\n>>> RUNNING MODELS WITH REGIONAL FIXED EFFECTS <<<\n\n")
-
-# Define what we're testing - FIXED WITH CORRECT NAME
-outcomes <- c("total_injuries", "cleaned_total_incidents")
-predictors <- c("z_basic_lgth_hours", "force_based", "contemporary_policing_composite", 
-                "z_fail_total", "violentclearance_rate")
-
-# Store results
-regional_results <- list()
-
-# Run models
-for(outcome in outcomes) {
-  cat("Analyzing with regional effects:", outcome, "\n")
-  
-  # Show distribution
-  tbl <- table(data_final[[outcome]][data_final$.imp == 1], useNA = "ifany")
-  cat("  Zeros:", ifelse("0" %in% names(tbl), tbl["0"], 0), 
-      "| Non-zeros:", sum(tbl[names(tbl) != "0"], na.rm = TRUE), "\n")
-  
-  # Run model with regions
-  regional_result <- pooled_nb_regression_enhanced(
-    data_final, 
-    outcome, 
-    c(predictors, "region")
-  )
-  
-  if(!is.null(regional_result)) {
-    regional_results[[outcome]] <- regional_result
-    cat("  ✓ Regional effects model completed successfully\n")
-    cat("  McFadden R²:", sprintf("%.4f", regional_result$pseudo_r2$mcfadden), "\n\n")
-  } else {
-    cat("  ✗ Regional effects model failed\n\n")
-  }
-}
-
-# Display results
-if(length(regional_results) > 0) {
-  cat("\n", strrep("=", 80), "\n")
-  cat("MODEL COMPARISON: BASE vs. STATE vs. REGIONAL FIXED EFFECTS\n")
-  cat(strrep("=", 80), "\n\n")
-  
-  # Create comparison table
-  for(outcome in names(regional_results)) {
-    if(outcome %in% names(all_nb_results) && 
-       outcome %in% names(state_effects_results)) {
-      
-      base_r2 <- all
-      
-      # Continue from where it left off...
-      base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-      state_r2 <- state_effects_results[[outcome]]$pseudo_r2$mcfadden
-      regional_r2 <- regional_results[[outcome]]$pseudo_r2$mcfadden
-      
-      cat(outcome, ":\n")
-      cat("  Base McFadden R²:     ", sprintf("%.4f", base_r2), "\n")
-      cat("  Regional McFadden R²: ", sprintf("%.4f", regional_r2), 
-          " (", sprintf("%+.1f%%", ((regional_r2 - base_r2)/base_r2)*100), ")\n")
-      cat("  State McFadden R²:    ", sprintf("%.4f", state_r2), 
-          " (", sprintf("%+.1f%%", ((state_r2 - base_r2)/base_r2)*100), ")\n\n")
-    }
-  }
-  
-  # Show regional effects
-  cat(strrep("=", 80), "\n")
-  cat("REGIONAL EFFECTS (IRRs relative to South)\n")
-  cat(strrep("=", 80), "\n")
-  
-  for(outcome in names(regional_results)) {
-    cat("\n", outcome, ":\n")
-    summary_df <- regional_results[[outcome]]$summary
-    region_rows <- summary_df[grepl("^region", summary_df$term), ]
-    
-    if(nrow(region_rows) > 0) {
-      print(region_rows[, c("term", "IRR", "IRR.lower", "IRR.upper", "p.value", "stars")])
-    }
-  }
-}
-
-# Re-run regional analysis with FULL predictor set for fair comparison
-cat("\n=== REGIONAL ANALYSIS WITH FULL PREDICTORS ===\n\n")
-
-# Run models with all predictors plus region
-regional_full_results <- list()
-
-for(outcome in c("total_injuries", "cleaned_total_incidents")) {
-  cat("Analyzing", outcome, "with full predictors + regional effects\n")
-  
-  # Run model with ALL predictors plus region
-  result <- pooled_nb_regression_enhanced(
-    data_final, 
-    outcome, 
-    c(preds_full, "region")
-  )
-  
-  if(!is.null(result)) {
-    regional_full_results[[outcome]] <- result
-    cat("✓ Model completed. McFadden R²:", round(result$pseudo_r2$mcfadden, 4), "\n")
-    
-    # Compare with base model
-    if(outcome %in% names(all_nb_results)) {
-      base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-      improvement <- result$pseudo_r2$mcfadden - base_r2
-      pct_imp <- (improvement / base_r2) * 100
-      cat("  Base R²:", round(base_r2, 4), 
-          "| Improvement:", round(improvement, 4),
-          "(", sprintf("%+.1f%%", pct_imp), ")\n\n")
-    }
-  }
-}
-
-# Create comprehensive comparison
-cat("\n", strrep("=", 80), "\n")
-cat("FAIR MODEL COMPARISON: All Models with Same Predictors\n")
+cat("SUMMARY: SAMPLE SIZE CHANGES DUE TO COOK'S D\n")
 cat(strrep("=", 80), "\n\n")
 
-for(outcome in names(regional_full_results)) {
-  if(outcome %in% names(all_nb_results) && 
-     outcome %in% names(state_effects_results)) {
-    
-    base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-    regional_sparse_r2 <- regional_results[[outcome]]$pseudo_r2$mcfadden
-    regional_full_r2 <- regional_full_results[[outcome]]$pseudo_r2$mcfadden
-    state_r2 <- state_effects_results[[outcome]]$pseudo_r2$mcfadden
-    
-    cat(outcome, ":\n")
-    cat("  Base (full predictors):        ", sprintf("%.4f", base_r2), "\n")
-    cat("  Regional (5 predictors only):  ", sprintf("%.4f", regional_sparse_r2), 
-        sprintf(" (%+.1f%%)", ((regional_sparse_r2 - base_r2)/base_r2)*100), "\n")
-    cat("  Regional (full predictors):    ", sprintf("%.4f", regional_full_r2), 
-        sprintf(" (%+.1f%%)", ((regional_full_r2 - base_r2)/base_r2)*100), "\n")
-    cat("  State (full predictors):       ", sprintf("%.4f", state_r2), 
-        sprintf(" (%+.1f%%)", ((state_r2 - base_r2)/base_r2)*100), "\n\n")
-  }
-}
+cat("Original N per imputation: 324\n")
+cat("After removing clearance rate outliers: 322\n\n")
 
-# Show regional effects from full model
-cat(strrep("=", 80), "\n")
-cat("REGIONAL EFFECTS FROM FULL MODEL (IRRs relative to South)\n")
-cat(strrep("=", 80), "\n")
+cat("Average N after Cook's D removal:\n")
+cat(strrep("-", 40), "\n")
 
-for(outcome in names(regional_full_results)) {
-  cat("\n", outcome, ":\n")
-  summary_df <- regional_full_results[[outcome]]$summary
-  region_rows <- summary_df[grepl("^region", summary_df$term), ]
-  
-  if(nrow(region_rows) > 0) {
-    print(region_rows[, c("term", "IRR", "IRR.lower", "IRR.upper", "p.value", "stars")])
-  }
-}
-
-# === ADD REGIONAL EFFECTS TO ALL MODELS ===
-cat("\n\n", strrep("=", 80), "\n")
-cat("RUNNING REGIONAL MODELS FOR ALL INJURY AND INCIDENT TYPES\n")
-cat(strrep("=", 80), "\n\n")
-
-# Define all outcomes
-injury_outcomes <- c("total_inj_firearms", "total_inj_knife", "total_inj_other", "total_inj_hands", "total_injuries")
-incident_outcomes <- c("cleaned_total_firearms", "cleaned_total_knife", "cleaned_total_other", "cleaned_total_hands", "cleaned_total_incidents")
-
-# Store regional results
-regional_all_results <- list()
-
-# Run regional models for all outcomes
-for(outcome in c(injury_outcomes, incident_outcomes)) {
-  if(outcome %in% names(data_final)) {
-    cat("Analyzing:", outcome, "with regional effects\n")
-    
-    # Run model with full predictors + region
-    result <- pooled_nb_regression_enhanced(
-      data_final, 
-      outcome, 
-      c(preds_full, "region")
-    )
-    
-    if(!is.null(result)) {
-      regional_all_results[[outcome]] <- result
-      cat("  ✓ Completed. McFadden R²:", sprintf("%.3f", result$pseudo_r2$mcfadden))
-      
-      # Compare with base
-      if(outcome %in% names(all_nb_results)) {
-        base_r2 <- all_nb_results[[outcome]]$pseudo_r2$mcfadden
-        improvement <- ((result$pseudo_r2$mcfadden - base_r2) / base_r2) * 100
-        cat(sprintf(" (%+.1f%% vs base)", improvement))
-      }
-      cat("\n")
-    } else {
-      cat("  ✗ Model failed\n")
-    }
-  }
-}
-
-# Create enhanced comparison table
-create_enhanced_comparison <- function(base_results, regional_results) {
-  cat("\n\n", strrep("=", 100), "\n")
-  cat("COMPREHENSIVE MODEL COMPARISON: BASE vs. REGIONAL FIXED EFFECTS\n")
-  cat(strrep("=", 100), "\n")
-  
-  # Separate by type
-  injury_models <- list()
-  incident_models <- list()
-  
-  for(name in names(regional_results)) {
-    if(grepl("inj", name)) {
-      injury_models[[name]] <- regional_results[[name]]
-    } else {
-      incident_models[[name]] <- regional_results[[name]]
-    }
-  }
-  
-  # Get all predictors
-  all_predictors <- unique(unlist(lapply(regional_results, function(x) x$summary$term)))
-  all_predictors <- all_predictors[!all_predictors %in% c("(Intercept)", "regionNortheast", "regionMidwest", "regionWest")]
-  all_predictors <- sort(all_predictors)
-  
-  # Print INJURY models
-  if(length(injury_models) > 0) {
-    cat("\n--- INJURY MODELS (with Regional Effects) ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Predictor"))
-    for(outcome in names(injury_models)) {
-      short_name <- gsub("total_inj_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs
-    for(pred in all_predictors) {
-      cat(sprintf("%-35s", substr(pred, 1, 35)))
-      
-      for(outcome in names(injury_models)) {
-        if(!is.null(injury_models[[outcome]])) {
-          sum_df <- injury_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        }
-      }
-      cat("\n")
-    }
-    
-    # Add regional effects
-    cat(strrep("-", 100), "\n")
-    cat("REGIONAL EFFECTS:\n")
-    for(reg in c("regionNortheast", "regionMidwest", "regionWest")) {
-      cat(sprintf("%-35s", gsub("region", "", reg)))
-      for(outcome in names(injury_models)) {
-        sum_df <- injury_models[[outcome]]$summary
-        pred_row <- sum_df[sum_df$term == reg, ]
-        if(nrow(pred_row) > 0) {
-          irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-          cat(sprintf(" %15s", irr_str))
-        } else {
-          cat(sprintf(" %15s", "-"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit comparison
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Base McFadden R²"))
-    for(outcome in names(injury_models)) {
-      if(outcome %in% names(base_results)) {
-        cat(sprintf(" %15.3f", base_results[[outcome]]$pseudo_r2$mcfadden))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Regional McFadden R²"))
-    for(outcome in names(injury_models)) {
-      cat(sprintf(" %15.3f", injury_models[[outcome]]$pseudo_r2$mcfadden))
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Improvement"))
-    for(outcome in names(injury_models)) {
-      if(outcome %in% names(base_results)) {
-        base_r2 <- base_results[[outcome]]$pseudo_r2$mcfadden
-        reg_r2 <- injury_models[[outcome]]$pseudo_r2$mcfadden
-        improvement <- ((reg_r2 - base_r2) / base_r2) * 100
-        cat(sprintf(" %14.1f%%", improvement))
-      }
-    }
-    cat("\n")
-  }
-  
-  # Print INCIDENT models
-  if(length(incident_models) > 0) {
-    cat("\n\n--- INCIDENT MODELS (with Regional Effects) ---\n")
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Predictor"))
-    for(outcome in names(incident_models)) {
-      short_name <- gsub("cleaned_total_|cleaned_|total_", "", outcome)
-      cat(sprintf(" %15s", short_name))
-    }
-    cat("\n")
-    cat(strrep("-", 100), "\n")
-    
-    # Print IRRs
-    for(pred in all_predictors) {
-      cat(sprintf("%-35s", substr(pred, 1, 35)))
-      
-      for(outcome in names(incident_models)) {
-        if(!is.null(incident_models[[outcome]])) {
-          sum_df <- incident_models[[outcome]]$summary
-          pred_row <- sum_df[sum_df$term == pred, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-            cat(sprintf(" %15s", irr_str))
-          } else {
-            cat(sprintf(" %15s", "-"))
-          }
-        }
-      }
-      cat("\n")
-    }
-    
-    # Add regional effects
-    cat(strrep("-", 100), "\n")
-    cat("REGIONAL EFFECTS:\n")
-    for(reg in c("regionNortheast", "regionMidwest", "regionWest")) {
-      cat(sprintf("%-35s", gsub("region", "", reg)))
-      for(outcome in names(incident_models)) {
-        sum_df <- incident_models[[outcome]]$summary
-        pred_row <- sum_df[sum_df$term == reg, ]
-        if(nrow(pred_row) > 0) {
-          irr_str <- sprintf("%.3f%s", pred_row$IRR[1], pred_row$stars[1])
-          cat(sprintf(" %15s", irr_str))
-        } else {
-          cat(sprintf(" %15s", "-"))
-        }
-      }
-      cat("\n")
-    }
-    
-    # Model fit comparison
-    cat(strrep("-", 100), "\n")
-    cat(sprintf("%-35s", "Base McFadden R²"))
-    for(outcome in names(incident_models)) {
-      if(outcome %in% names(base_results)) {
-        cat(sprintf(" %15.3f", base_results[[outcome]]$pseudo_r2$mcfadden))
-      }
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Regional McFadden R²"))
-    for(outcome in names(incident_models)) {
-      cat(sprintf(" %15.3f", incident_models[[outcome]]$pseudo_r2$mcfadden))
-    }
-    cat("\n")
-    
-    cat(sprintf("%-35s", "Improvement"))
-    for(outcome in names(incident_models)) {
-      if(outcome %in% names(base_results)) {
-        base_r2 <- base_results[[outcome]]$pseudo_r2$mcfadden
-        reg_r2 <- incident_models[[outcome]]$pseudo_r2$mcfadden
-        improvement <- ((reg_r2 - base_r2) / base_r2) * 100
-        cat(sprintf(" %14.1f%%", improvement))
-      }
-    }
-    cat("\n")
-  }
-  
-  cat(strrep("-", 100), "\n")
-  cat("Significance: *** p<0.001, ** p<0.01, * p<0.05, † p<0.1\n")
-  cat("Regional effects are relative to South (reference category)\n")
-}
-
-# Create the enhanced comparison
-if(length(regional_all_results) > 0) {
-  create_enhanced_comparison(all_nb_results, regional_all_results)
-}
-
-# Export regional results
-regional_export_df <- data.frame()
+cat("\nINJURY OUTCOMES:\n")
 for(outcome in names(regional_all_results)) {
-  if(!is.null(regional_all_results[[outcome]])) {
-    df <- regional_all_results[[outcome]]$summary
-    df$outcome <- outcome
-    df$model_type <- "Regional"
-    regional_export_df <- rbind(regional_export_df, df)
+  if(grepl("inj", outcome)) {
+    avg_n <- regional_all_results[[outcome]]$avg_n
+    removed <- 322 - avg_n
+    pct_removed <- round((removed/322) * 100, 1)
+    cat(sprintf("  %-25s: %3d (removed %2d, %.1f%%)\n", 
+                outcome, avg_n, removed, pct_removed))
   }
 }
 
-write.csv(regional_export_df, 
-          paste0(save_path, "nb_regional_all_outcomes_results.csv"), 
-          row.names = FALSE)
+cat("\nINCIDENT OUTCOMES:\n")
+for(outcome in names(regional_all_results)) {
+  if(!grepl("inj", outcome)) {
+    avg_n <- regional_all_results[[outcome]]$avg_n
+    removed <- 322 - avg_n
+    pct_removed <- round((removed/322) * 100, 1)
+    cat(sprintf("  %-25s: %3d (removed %2d, %.1f%%)\n", 
+                outcome, avg_n, removed, pct_removed))
+  }
+}
 
-cat("\n\n✓ Regional results exported to: nb_regional_all_outcomes_results.csv\n")
 cat("\n✓ ANALYSIS COMPLETE\n")
-
-# CREATE APA-FORMATTED TABLES FOR BOTH MODELS
-# =============================================
-
-# Function to extract and format results for a specific outcome type
-create_apa_table <- function(results_list, outcome_type = "incident") {
-  
-  # Define which outcomes to include based on type
-  if(outcome_type == "incident") {
-    outcomes <- c("cleaned_total_hands", "cleaned_total_knife", 
-                  "cleaned_total_firearms", "cleaned_total_other", 
-                  "cleaned_total_incidents")
-    col_names <- c("Hands", "Knife", "Firearms", "Other", "Total")
-  } else {
-    outcomes <- c("total_inj_hands", "total_inj_knife", 
-                  "total_inj_firearms", "total_inj_other", 
-                  "total_injuries")
-    col_names <- c("Hands", "Knife", "Firearms", "Other", "Total")
-  }
-  
-  # Initialize the table
-  apa_table <- data.frame(Predictor = character(), stringsAsFactors = FALSE)
-  
-  # Add columns for each outcome
-  for(i in 1:length(outcomes)) {
-    apa_table[[col_names[i]]] <- character()
-  }
-  
-  # Define predictor order and labels
-  predictor_mapping <- list(
-    "ACADEMY STRUCTURE" = NULL,
-    "Basic Training Length" = "z_basic_lgth_hours",
-    "Field Training: Mandatory for Some" = "field_man1",
-    "Field Training: Mandatory for All" = "field_man2",
-    "Environment: Low Stress" = "environment_31",
-    "Environment: High Stress" = "environment_33",
-    "Equipment Budget" = "z_ebudget",
-    "Operational Budget" = "z_opbudget",
-    "Overseeing Agency: College" = "agency_type32",
-    "Overseeing Agency: Other" = "agency_type33",
-    "Fitness Center" = "fitness_1",
-    "Obstacle Courses" = "obstacle_1",
-    "Firing Range" = "firerange",
-    "Scenario Training" = "scenario_1",
-    "Refresher Training" = "refresher",
-    " " = NULL,
-    "ACADEMY CURRICULUM" = NULL,
-    "Force-Based Instruction" = "force_based",
-    "Contemporary Policing Studies" = "contemporary_policing_composite",
-    "Special Topics Study" = "special_study",
-    "Full-time Sworn Instructors" = "z_ft_sworn",
-    "Full-time Civilian Instructors" = "z_ft_civ",
-    "Min. Education (College+)" = "min_ed_bin",
-    "  " = NULL,
-    "ACADEMY PERFORMANCE" = NULL,
-    "Total Failed: Physical" = "z_fail_phys_total",
-    "Total Failed: Academic" = "z_fail_academic_total",
-    "Total Failed: All Reasons" = "z_fail_total",
-    "   " = NULL,
-    "CONTROLS" = NULL,
-    "Average Officers" = "z_mean_officers",
-    "Total Violent Crime" = "z_total_violent",
-    "Violent Crime Clearance Rate" = "violentclearance_rate",
-    "    " = NULL,
-    "REGIONAL EFFECTS" = NULL,
-    "Northeast" = "regionNortheast",
-    "Midwest" = "regionMidwest",
-    "West" = "regionWest"
-  )
-  
-  # Build the table row by row
-  row_num <- 1
-  for(pred_label in names(predictor_mapping)) {
-    apa_table[row_num, "Predictor"] <- pred_label
-    
-    pred_name <- predictor_mapping[[pred_label]]
-    
-    if(!is.null(pred_name)) {
-      # This is a regular predictor, get values
-      for(i in 1:length(outcomes)) {
-        outcome <- outcomes[i]
-        col_name <- col_names[i]
-        
-        if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
-          summary_df <- results_list[[outcome]]$summary
-          pred_row <- summary_df[summary_df$term == pred_name, ]
-          
-          if(nrow(pred_row) > 0) {
-            irr <- pred_row$IRR[1]
-            se <- pred_row$std.error[1]
-            stars <- pred_row$stars[1]
-            
-            # Format as "IRR*stars* (SE)"
-            cell_value <- sprintf("%.3f%s (%.3f)", irr, stars, se)
-            apa_table[row_num, col_name] <- cell_value
-          } else {
-            apa_table[row_num, col_name] <- "-"
-          }
-        } else {
-          apa_table[row_num, col_name] <- "-"
-        }
-      }
-    } else {
-      # This is a header row, leave other columns empty
-      for(col_name in col_names) {
-        apa_table[row_num, col_name] <- ""
-      }
-    }
-    
-    row_num <- row_num + 1
-  }
-  
-  # Add model fit statistics
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- ""
-  for(col_name in col_names) {
-    apa_table[nrow(apa_table), col_name] <- ""
-  }
-  
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- "MODEL FIT"
-  for(col_name in col_names) {
-    apa_table[nrow(apa_table), col_name] <- ""
-  }
-  
-  # McFadden R²
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- "McFadden R²"
-  for(i in 1:length(outcomes)) {
-    outcome <- outcomes[i]
-    col_name <- col_names[i]
-    
-    if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
-      r2 <- results_list[[outcome]]$pseudo_r2$mcfadden
-      apa_table[nrow(apa_table), col_name] <- sprintf("%.3f", r2)
-    } else {
-      apa_table[nrow(apa_table), col_name] <- "-"
-    }
-  }
-  
-  # Nagelkerke R²
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- "Nagelkerke R²"
-  for(i in 1:length(outcomes)) {
-    outcome <- outcomes[i]
-    col_name <- col_names[i]
-    
-    if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
-      r2 <- results_list[[outcome]]$pseudo_r2$nagelkerke
-      apa_table[nrow(apa_table), col_name] <- sprintf("%.3f", r2)
-    } else {
-      apa_table[nrow(apa_table), col_name] <- "-"
-    }
-  }
-  
-  # AIC
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- "AIC"
-  for(i in 1:length(outcomes)) {
-    outcome <- outcomes[i]
-    col_name <- col_names[i]
-    
-    if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
-      aic <- results_list[[outcome]]$avg_aic
-      apa_table[nrow(apa_table), col_name] <- sprintf("%.1f", aic)
-    } else {
-      apa_table[nrow(apa_table), col_name] <- "-"
-    }
-  }
-  
-  # N
-  apa_table[nrow(apa_table) + 1, "Predictor"] <- "N"
-  for(i in 1:length(outcomes)) {
-    outcome <- outcomes[i]
-    col_name <- col_names[i]
-    
-    if(outcome %in% names(results_list) && !is.null(results_list[[outcome]])) {
-      n <- results_list[[outcome]]$n_obs
-      apa_table[nrow(apa_table), col_name] <- sprintf("%d", n)
-    } else {
-      apa_table[nrow(apa_table), col_name] <- "-"
-    }
-  }
-  
-  return(apa_table)
-}
-
-# Create tables for both outcomes
-# Use regional_all_results if you want regional effects, or all_nb_results for base models
-
-cat("\n=====================================\n")
-cat("TABLE 1: OFFICER INJURIES\n")
-cat("=====================================\n\n")
-
-injury_table <- create_apa_table(regional_all_results, outcome_type = "injury")
-print(injury_table, row.names = FALSE, right = FALSE)
-
-# Save to original analysis folder
-write.csv(injury_table, 
-          paste0(save_path, "table_officer_injuries_apa.csv"), 
-          row.names = FALSE)
-
-cat("\n=====================================\n")
-cat("TABLE 2: OFFICER INCIDENTS\n")
-cat("=====================================\n\n")
-
-incident_table <- create_apa_table(regional_all_results, outcome_type = "incident")
-print(incident_table, row.names = FALSE, right = FALSE)
-
-# Save to original analysis folder
-write.csv(incident_table, 
-          paste0(save_path, "table_officer_incidents_apa.csv"), 
-          row.names = FALSE)
-
-# =============================================
-# EXPORT TO MAC DOWNLOADS FOLDER
-# =============================================
-
-# Set Downloads folder path
-downloads_path <- "~/Downloads/"
-
-# Export injury table to Downloads
-write.csv(injury_table, 
-          paste0(downloads_path, "table_officer_injuries_apa.csv"), 
-          row.names = FALSE)
-cat("\n✓ Officer Injuries table exported to Downloads folder\n")
-
-# Export incident table to Downloads
-write.csv(incident_table, 
-          paste0(downloads_path, "table_officer_incidents_apa.csv"), 
-          row.names = FALSE)
-cat("✓ Officer Incidents table exported to Downloads folder\n")
-
-# Also export as Excel files for easier formatting
-library(openxlsx)
-
-# Create Excel workbook with both tables
-wb <- createWorkbook()
-
-# Add injuries sheet
-addWorksheet(wb, "Officer Injuries")
-writeData(wb, sheet = "Officer Injuries", injury_table, rowNames = FALSE)
-
-# Add incidents sheet
-addWorksheet(wb, "Officer Incidents")
-writeData(wb, sheet = "Officer Incidents", incident_table, rowNames = FALSE)
-
-# Save Excel file to Downloads
-saveWorkbook(wb, paste0(downloads_path, "negative_binomial_results_tables.xlsx"), overwrite = TRUE)
-cat("✓ Combined Excel file exported to Downloads folder\n")
-
-# Create a prettier display function for console
-display_apa_table <- function(table_df, title) {
-  cat("\n", strrep("=", 90), "\n")
-  cat(title, "\n")
-  cat(strrep("=", 90), "\n\n")
-  
-  # Print header
-  cat(sprintf("%-35s", "Predictor"))
-  for(col in names(table_df)[-1]) {
-    cat(sprintf(" %18s", col))
-  }
-  cat("\n")
-  cat(strrep("-", 90 + 18 * (ncol(table_df) - 1)), "\n")
-  
-  # Print rows
-  for(i in 1:nrow(table_df)) {
-    pred <- table_df[i, "Predictor"]
-    
-    # Check if this is a section header
-    if(pred %in% c("ACADEMY STRUCTURE", "ACADEMY CURRICULUM", "ACADEMY PERFORMANCE", 
-                   "CONTROLS", "REGIONAL EFFECTS", "MODEL FIT")) {
-      cat("\n", pred, "\n")
-      cat(strrep("-", 90 + 18 * (ncol(table_df) - 1)), "\n")
-    } else if(pred != "") {
-      cat(sprintf("%-35s", substr(pred, 1, 35)))
-      for(j in 2:ncol(table_df)) {
-        cat(sprintf(" %18s", table_df[i, j]))
-      }
-      cat("\n")
-    }
-  }
-  
-  cat("\n")
-  cat("Note: Values are Incident Rate Ratios (IRRs) with standard errors in parentheses.\n")
-  cat("† p < 0.10, * p < 0.05, ** p < 0.01, *** p < 0.001\n")
-  cat("Reference categories: Field Training = Not Mandatory; Environment = Moderate Stress;\n")
-  cat("Overseeing Agency = State POST; Region = South.\n")
-}
-
-# Display both tables nicely
-display_apa_table(injury_table, "TABLE 1: OFFICER INJURIES")
-display_apa_table(incident_table, "TABLE 2: OFFICER INCIDENTS")
-
-# Create LaTeX version for direct inclusion in papers
-create_latex_table <- function(table_df, caption, label) {
-  cat("\n\\begin{table}[htbp]\n")
-  cat("\\centering\n")
-  cat("\\caption{", caption, "}\n")
-  cat("\\label{", label, "}\n")
-  cat("\\begin{tabular}{lccccc}\n")
-  cat("\\hline\n")
-  
-  # Header
-  cat("Predictor & Hands & Knife & Firearms & Other & Total \\\\\n")
-  cat("\\hline\n")
-  
-  # Body
-  for(i in 1:nrow(table_df)) {
-    pred <- table_df[i, "Predictor"]
-    
-    if(pred %in% c("ACADEMY STRUCTURE", "ACADEMY CURRICULUM", "ACADEMY PERFORMANCE", 
-                   "CONTROLS", "REGIONAL EFFECTS", "MODEL FIT")) {
-      cat("\\multicolumn{6}{l}{\\textbf{", pred, "}} \\\\\n")
-    } else if(pred != "") {
-      cat(pred)
-      for(j in 2:ncol(table_df)) {
-        cat(" & ", table_df[i, j])
-      }
-      cat(" \\\\\n")
-    }
-  }
-  
-  cat("\\hline\n")
-  cat("\\end{tabular}\n")
-  cat("\\end{table}\n")
-}
-
-# Generate LaTeX tables
-cat("\n\n========== LATEX VERSION ==========\n")
-create_latex_table(injury_table, 
-                   "Negative Binomial Regression Results: Officer Injuries", 
-                   "tab:injuries")
-create_latex_table(incident_table, 
-                   "Negative Binomial Regression Results: Officer Incidents", 
-                   "tab:incidents")
-
-cat("\n\n✓ EXPORT COMPLETE\n")
-cat("Files saved to Downloads folder:\n")
-cat("  - table_officer_injuries_apa.csv\n")
-cat("  - table_officer_incidents_apa.csv\n")
-cat("  - negative_binomial_results_tables.xlsx (combined Excel file)\n")
-cat("\nFiles also saved to analysis folder:\n")
-cat("  ", save_path, "\n")
+cat("✓ Cook's D applied to ALL outcomes (injuries and incidents)\n")
+cat("✓ VIF check performed before models\n")
+cat("✓ Binary college variable used for firearms injuries model\n")
+cat("✓ Total Failed: All Reasons variable removed\n")
+cat("✓ Tables report average N across 20 imputations\n")
+cat("✓ Files saved with '_cooksd' suffix\n")
